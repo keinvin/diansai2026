@@ -1,0 +1,99 @@
+{
+  "measurements": [
+    {
+      "direction": "forward",
+      "target_deg": -80.0,
+      "actual_deg": -79.5,
+      "error_deg": 0.5,
+      "settle_seconds": 2.305649147998338,
+      "sample_span_deg": 0.0
+    },
+    {
+      "direction": "forward",
+      "target_deg": -40.0,
+      "actual_deg": -40.1,
+      "error_deg": -0.10000000000000142,
+      "settle_seconds": 2.304749760998675,
+      "sample_span_deg": 0.0
+    },
+    {
+      "direction": "forward",
+      "target_deg": 0.0,
+      "actual_deg": -0.125,
+      "error_deg": -0.125,
+      "settle_seconds": 2.30461784200088,
+      "sample_span_deg": 0.1
+    },
+    {
+      "direction": "forward",
+      "target_deg": 40.0,
+      "actual_deg": 39.6,
+      "error_deg": -0.3999999999999986,
+      "settle_seconds": 2.304638633002469,
+      "sample_span_deg": 0.0
+    },
+    {
+      "direction": "forward",
+      "target_deg": 80.0,
+      "actual_deg": 79.6,
+      "error_deg": -0.4000000000000057,
+      "settle_seconds": 2.304750592000346,
+      "sample_span_deg": 0.0
+    },
+    {
+      "direction": "reverse",
+      "target_deg": 80.0,
+      "actual_deg": 79.57499999999999,
+      "error_deg": -0.42500000000001137,
+      "settle_seconds": 1.9036077730015677,
+      "sample_span_deg": 0.09999999999999432
+    },
+    {
+      "direction": "reverse",
+      "target_deg": 40.0,
+      "actual_deg": 40.3,
+      "error_deg": 0.29999999999999716,
+      "settle_seconds": 2.30515251199904,
+      "sample_span_deg": 0.0
+    },
+    {
+      "direction": "reverse",
+      "target_deg": 0.0,
+      "actual_deg": 0.225,
+      "error_deg": 0.225,
+      "settle_seconds": 2.304959509001492,
+      "sample_span_deg": 0.09999999999999998
+    },
+    {
+      "direction": "reverse",
+      "target_deg": -40.0,
+      "actual_deg": -39.6,
+      "error_deg": 0.3999999999999986,
+      "settle_seconds": 2.305480474002252,
+      "sample_span_deg": 0.0
+    },
+    {
+      "direction": "reverse",
+      "target_deg": -80.0,
+      "actual_deg": -79.5,
+      "error_deg": 0.5,
+      "settle_seconds": 2.3050236749986652,
+      "sample_span_deg": 0.0
+    }
+  ],
+  "analysis": {
+    "mean_error_deg": 0.04749999999999787,
+    "error_range_deg": 0.9250000000000114,
+    "error_stdev_deg": 0.3611526685489133,
+    "direction_hysteresis_deg": {
+      "-80.0": 0.0,
+      "-40.0": 0.5,
+      "0.0": 0.35,
+      "40.0": 0.6999999999999957,
+      "80.0": -0.025000000000005684
+    },
+    "max_hysteresis_deg": 0.6999999999999957,
+    "constant_bias": false,
+    "suggested_command_offset_deg": null
+  }
+}

@@ -71,3 +71,41 @@ For camera-derived contours with roughly 0.5 mm or less vertex error, start with
 
 Tighten these tolerances after camera-to-machine calibration is stable. Loose
 tolerances increase the number of geometrically ambiguous assemblies.
+
+## OpenCV piece detection
+
+Install the camera/vision dependency:
+
+```powershell
+python -m pip install -r puzzle_solver/requirements-vision.txt
+```
+
+Edit `examples/vision_config.json` so `a4_corners_px` contains the measured A4
+corners in this order: top-left, top-right, bottom-right, bottom-left. The
+homography maps camera pixels directly to A4 millimetres and limits detection to
+the upper half of the paper.
+
+Detect pieces from an image and immediately solve their target poses:
+
+```powershell
+python -m puzzle_solver.vision `
+  --image scene.jpg `
+  --config puzzle_solver/examples/vision_config.json `
+  --detections detections.json `
+  --solution solution.json `
+  --debug-image detection-overlay.png `
+  --mask-image detection-mask.png
+```
+
+Use a camera directly by replacing `--image scene.jpg` with `--camera 0`.
+The default `background_difference` mode estimates the A4 background colour in
+Lab space and keeps all sufficiently different pixels. Unlike a white-only
+threshold, this preserves black and red card printing even when a printed mark
+crosses a cut edge. Use a matte, strongly saturated paper colour and keep the
+paper division line outside the upper-half ROI when possible. The optional
+`white` mode remains available for plain white pieces.
+
+The detector outputs each simplified polygon, its area, centroid, minimum edge,
+and a distance-transform pickup point. The solution additionally contains
+`pickup_source_mm` and `pickup_target_mm`, which can be sent to the writing
+machine controller.
