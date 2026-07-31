@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import cv2
 import numpy as np
 
 
@@ -27,6 +29,16 @@ class SolverConfig:
     max_overlap_ratio: float = 0.002
     max_search_nodes_per_rectangle: int = 300_000
     max_solutions_per_rectangle: int = 8
+    max_solve_seconds: float = 0.0
+    placement_gap_mm: float = 1.5
+    max_placement_gap_mm: float = 8.0
+    adjacency_detection_tolerance_mm: float = 8.0
+    max_adjacent_vertex_distance_mm: float = 20.0
+    final_overlap_tolerance_mm2: float = 0.25
+    pattern_score_weight: float = 0.15
+    min_pattern_evidence: float = 0.12
+    max_pattern_mismatch: float = 0.45
+    require_connected_assembly: bool = True
 
 
 @dataclass
@@ -280,13 +292,14 @@ def _search_rectangle(
     height: float,
     dimension_error: float,
     config: SolverConfig,
-) -> tuple[list[tuple[float, list[PoseCandidate], dict]], int]:
+    deadline: float | None = None,
+) -> tuple[list[tuple[float, list[PoseCandidate], dict]], int, bool]:
     candidates = [
         generate_piece_poses(index, polygon, width, height, config)
         for index, polygon in enumerate(polygons)
     ]
     if any(not piece_candidates for piece_candidates in candidates):
-        return [], 0
+        return [], 0, False
 
     order = sorted(range(len(polygons)), key=lambda index: len(candidates[index]))
     rectangle_cells = int(round(width / config.grid_mm)) * int(
@@ -305,10 +318,14 @@ def _search_rectangle(
     chosen: list[PoseCandidate | None] = [None] * len(polygons)
     solutions: list[tuple[float, list[PoseCandidate], dict]] = []
     nodes = 0
+    timed_out = False
 
     def dfs(depth: int, occupied: int, overlap_cells: int) -> None:
-        nonlocal nodes
+        nonlocal nodes, timed_out
         if nodes >= config.max_search_nodes_per_rectangle:
+            return
+        if deadline is not None and nodes % 256 == 0 and time.monotonic() >= deadline:
+            timed_out = True
             return
         nodes += 1
 
@@ -337,6 +354,8 @@ def _search_rectangle(
 
         piece_index = order[depth]
         for pose in candidates[piece_index]:
+            if timed_out:
+                return
             overlap = (occupied & pose.mask).bit_count()
             new_overlap = overlap_cells + overlap
             if new_overlap > allowed_overlap:
@@ -346,7 +365,331 @@ def _search_rectangle(
             chosen[piece_index] = None
 
     dfs(0, 0, 0)
-    return solutions, nodes
+    return solutions, nodes, timed_out
+
+
+def _detect_edge_adjacencies(
+    polygons: Sequence[np.ndarray],
+    piece_ids: Sequence[str],
+    config: SolverConfig,
+) -> list[dict]:
+    """Find paired target edges before the safety gap is applied.
+
+    The raster solver does not explicitly connect edges.  Recovering the edge pairs
+    here gives the caller concrete seams on which to perform image-pattern checks.
+    """
+
+    candidates: list[tuple[float, dict]] = []
+    tolerance = min(
+        config.adjacency_detection_tolerance_mm,
+        config.max_adjacent_vertex_distance_mm,
+    )
+    for piece_a in range(len(polygons)):
+        polygon_a = polygons[piece_a]
+        for piece_b in range(piece_a + 1, len(polygons)):
+            polygon_b = polygons[piece_b]
+            for edge_a in range(len(polygon_a)):
+                a0 = polygon_a[edge_a]
+                a1 = polygon_a[(edge_a + 1) % len(polygon_a)]
+                length_a = float(np.linalg.norm(a1 - a0))
+                for edge_b in range(len(polygon_b)):
+                    b0 = polygon_b[edge_b]
+                    b1 = polygon_b[(edge_b + 1) % len(polygon_b)]
+                    length_b = float(np.linalg.norm(b1 - b0))
+                    if max(length_a, length_b) <= 1e-9:
+                        continue
+                    same = (float(np.linalg.norm(a0 - b0)), float(np.linalg.norm(a1 - b1)))
+                    reverse = (
+                        float(np.linalg.norm(a0 - b1)),
+                        float(np.linalg.norm(a1 - b0)),
+                    )
+                    is_reversed = max(reverse) < max(same)
+                    distances = reverse if is_reversed else same
+                    maximum_distance = max(distances)
+                    length_error = abs(length_a - length_b) / max(length_a, length_b)
+                    if length_error <= 0.20 and maximum_distance <= tolerance:
+                        interval_a = [0.0, 1.0]
+                        interval_b = [1.0, 0.0] if is_reversed else [0.0, 1.0]
+                        score = maximum_distance + 0.25 * sum(distances) + 5.0 * length_error
+                    else:
+                        direction_a = (a1 - a0) / length_a
+                        direction_b = (b1 - b0) / length_b
+                        parallel_error = abs(
+                            float(
+                                direction_a[0] * direction_b[1]
+                                - direction_a[1] * direction_b[0]
+                            )
+                        )
+                        if parallel_error > math.sin(math.radians(12.0)):
+                            continue
+                        normal_a = np.array([-direction_a[1], direction_a[0]])
+                        line_error = max(
+                            abs(float(np.dot(b0 - a0, normal_a))),
+                            abs(float(np.dot(b1 - a0, normal_a))),
+                        )
+                        if line_error > tolerance:
+                            continue
+                        projected_b = [
+                            float(np.dot(b0 - a0, direction_a)),
+                            float(np.dot(b1 - a0, direction_a)),
+                        ]
+                        overlap_start = max(0.0, min(projected_b))
+                        overlap_end = min(length_a, max(projected_b))
+                        overlap_length = overlap_end - overlap_start
+                        if overlap_length < max(10.0, 0.35 * min(length_a, length_b)):
+                            continue
+                        point_start = a0 + direction_a * overlap_start
+                        point_end = a0 + direction_a * overlap_end
+                        interval_a = [overlap_start / length_a, overlap_end / length_a]
+                        interval_b = [
+                            float(np.dot(point_start - b0, direction_b) / length_b),
+                            float(np.dot(point_end - b0, direction_b) / length_b),
+                        ]
+                        interval_b = [float(np.clip(value, 0.0, 1.0)) for value in interval_b]
+                        is_reversed = interval_b[1] < interval_b[0]
+                        score = line_error + 10.0 * parallel_error + 3.0
+                    candidates.append(
+                        (
+                            score,
+                            {
+                                "piece_a": piece_a,
+                                "piece_b": piece_b,
+                                "piece_a_id": piece_ids[piece_a],
+                                "piece_b_id": piece_ids[piece_b],
+                                "edge_a": edge_a,
+                                "edge_b": edge_b,
+                                "edge_b_reversed": is_reversed,
+                                "edge_a_interval": interval_a,
+                                "edge_b_interval": interval_b,
+                                "edge_length_a_mm": length_a,
+                                "edge_length_b_mm": length_b,
+                            },
+                        )
+                    )
+
+    # Exact seams sort ahead of incidental pairs.  Interval occupancy still permits
+    # one long edge to pair with two disjoint shorter edges at a T junction.
+    used_intervals: dict[tuple[int, int], list[tuple[float, float]]] = {}
+
+    def interval_conflicts(key: tuple[int, int], interval: Sequence[float]) -> bool:
+        low, high = sorted((float(interval[0]), float(interval[1])))
+        length = max(high - low, 1e-9)
+        for used_low, used_high in used_intervals.get(key, []):
+            overlap = max(0.0, min(high, used_high) - max(low, used_low))
+            if overlap > 0.50 * length:
+                return True
+        return False
+
+    result: list[dict] = []
+    for _, adjacency in sorted(candidates, key=lambda item: item[0]):
+        key_a = (adjacency["piece_a"], adjacency["edge_a"])
+        key_b = (adjacency["piece_b"], adjacency["edge_b"])
+        interval_a = adjacency["edge_a_interval"]
+        interval_b = adjacency["edge_b_interval"]
+        if interval_conflicts(key_a, interval_a) or interval_conflicts(key_b, interval_b):
+            continue
+        for key, interval in ((key_a, interval_a), (key_b, interval_b)):
+            low, high = sorted((float(interval[0]), float(interval[1])))
+            used_intervals.setdefault(key, []).append((low, high))
+        result.append(adjacency)
+    return result
+
+
+def _placement_offsets(
+    polygons: Sequence[np.ndarray], width: float, height: float, gap_mm: float
+) -> list[np.ndarray]:
+    if len(polygons) <= 1 or gap_mm <= 0.0:
+        return [np.zeros(2, dtype=float) for _ in polygons]
+
+    rectangle_centre = np.array([width * 0.5, height * 0.5], dtype=float)
+    offsets: list[np.ndarray] = []
+    for index, polygon in enumerate(polygons):
+        direction = polygon.mean(axis=0) - rectangle_centre
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-9:
+            angle = 2.0 * math.pi * index / len(polygons)
+            direction = np.array([math.cos(angle), math.sin(angle)], dtype=float)
+        else:
+            direction /= norm
+        offsets.append(direction * gap_mm)
+    return offsets
+
+
+def _raster_overlap_area_mm2(
+    polygons: Sequence[np.ndarray], resolution_mm: float = 0.20
+) -> float:
+    if len(polygons) <= 1:
+        return 0.0
+    points = np.concatenate(polygons, axis=0)
+    minimum = points.min(axis=0) - resolution_mm * 2.0
+    maximum = points.max(axis=0) + resolution_mm * 2.0
+    size = np.ceil((maximum - minimum) / resolution_mm).astype(int) + 1
+    occupancy = np.zeros((int(size[1]), int(size[0])), dtype=np.uint8)
+    overlap_pixels = 0
+    for polygon in polygons:
+        contour = np.rint((polygon - minimum) / resolution_mm).astype(np.int32)
+        piece_mask = np.zeros_like(occupancy)
+        cv2.fillPoly(piece_mask, [contour], 1)
+        overlap_pixels += int(np.count_nonzero((occupancy > 0) & (piece_mask > 0)))
+        occupancy |= piece_mask
+    return overlap_pixels * resolution_mm * resolution_mm
+
+
+def _adjacency_vertex_distances(
+    polygons: Sequence[np.ndarray], adjacencies: list[dict]
+) -> list[dict]:
+    result: list[dict] = []
+    for adjacency in adjacencies:
+        polygon_a = polygons[adjacency["piece_a"]]
+        polygon_b = polygons[adjacency["piece_b"]]
+        edge_a = adjacency["edge_a"]
+        edge_b = adjacency["edge_b"]
+        edge_a_start = polygon_a[edge_a]
+        edge_a_end = polygon_a[(edge_a + 1) % len(polygon_a)]
+        edge_b_start = polygon_b[edge_b]
+        edge_b_end = polygon_b[(edge_b + 1) % len(polygon_b)]
+        interval_a = adjacency.get("edge_a_interval", [0.0, 1.0])
+        interval_b = adjacency.get(
+            "edge_b_interval", [1.0, 0.0] if adjacency["edge_b_reversed"] else [0.0, 1.0]
+        )
+        a0 = edge_a_start + (edge_a_end - edge_a_start) * interval_a[0]
+        a1 = edge_a_start + (edge_a_end - edge_a_start) * interval_a[1]
+        b0 = edge_b_start + (edge_b_end - edge_b_start) * interval_b[0]
+        b1 = edge_b_start + (edge_b_end - edge_b_start) * interval_b[1]
+        distances = [float(np.linalg.norm(a0 - b0)), float(np.linalg.norm(a1 - b1))]
+        result.append(
+            {
+                **adjacency,
+                "corresponding_vertex_distances_mm": distances,
+                "max_corresponding_vertex_distance_mm": max(distances),
+            }
+        )
+    return result
+
+
+def _profile_interval(
+    profile: np.ndarray, interval: Sequence[float], sample_count: int
+) -> np.ndarray:
+    source = np.linspace(0.0, 1.0, len(profile))
+    target = np.linspace(float(interval[0]), float(interval[1]), sample_count)
+    return np.column_stack(
+        [np.interp(target, source, profile[:, channel]) for channel in range(profile.shape[1])]
+    )
+
+
+def _score_edge_patterns(
+    adjacencies: list[dict],
+    edge_profiles: Sequence[Sequence[np.ndarray]] | None,
+) -> tuple[list[dict], float, float]:
+    """Attach LAB edge-profile mismatch scores to recovered seams.
+
+    A flat white edge carries no directional evidence and therefore receives zero
+    weight.  This prevents the solver from claiming that an unprinted/overexposed
+    piece has a verified pattern match.
+    """
+
+    if edge_profiles is None:
+        return adjacencies, 0.0, 0.0
+
+    scored: list[dict] = []
+    weighted_error = 0.0
+    total_evidence = 0.0
+    for adjacency in adjacencies:
+        profile_a = np.asarray(
+            edge_profiles[adjacency["piece_a"]][adjacency["edge_a"]], dtype=float
+        )
+        profile_b = np.asarray(
+            edge_profiles[adjacency["piece_b"]][adjacency["edge_b"]], dtype=float
+        )
+        sample_count = max(len(profile_a), len(profile_b))
+        profile_a = _profile_interval(
+            profile_a, adjacency.get("edge_a_interval", [0.0, 1.0]), sample_count
+        )
+        profile_b = _profile_interval(
+            profile_b,
+            adjacency.get(
+                "edge_b_interval",
+                [1.0, 0.0] if adjacency["edge_b_reversed"] else [0.0, 1.0],
+            ),
+            sample_count,
+        )
+
+        colour_delta = np.linalg.norm(profile_a - profile_b, axis=1)
+        mismatch = float(colour_delta.mean() / (255.0 * math.sqrt(3.0)))
+        variation = max(
+            float(np.mean(np.std(profile_a, axis=0))),
+            float(np.mean(np.std(profile_b, axis=0))),
+        )
+        gradient = max(
+            float(np.mean(np.linalg.norm(np.diff(profile_a, axis=0), axis=1))),
+            float(np.mean(np.linalg.norm(np.diff(profile_b, axis=0), axis=1))),
+        )
+        evidence = float(np.clip(max(variation / 15.0, gradient / 10.0), 0.0, 1.0))
+        weighted_error += mismatch * evidence
+        total_evidence += evidence
+        scored.append(
+            {
+                **adjacency,
+                "pattern_mismatch": mismatch,
+                "pattern_evidence": evidence,
+            }
+        )
+
+    mismatch = weighted_error / total_evidence if total_evidence > 1e-9 else 0.0
+    evidence = total_evidence / len(scored) if scored else 0.0
+    return scored, mismatch, evidence
+
+
+def _assembly_is_connected(piece_count: int, adjacencies: Sequence[dict]) -> bool:
+    if piece_count <= 1:
+        return True
+    neighbours: list[set[int]] = [set() for _ in range(piece_count)]
+    for adjacency in adjacencies:
+        piece_a = int(adjacency["piece_a"])
+        piece_b = int(adjacency["piece_b"])
+        neighbours[piece_a].add(piece_b)
+        neighbours[piece_b].add(piece_a)
+    visited = {0}
+    pending = [0]
+    while pending:
+        current = pending.pop()
+        for neighbour in neighbours[current] - visited:
+            visited.add(neighbour)
+            pending.append(neighbour)
+    return len(visited) == piece_count
+
+
+def _apply_safe_placement_gap(
+    polygons: Sequence[np.ndarray],
+    piece_ids: Sequence[str],
+    width: float,
+    height: float,
+    config: SolverConfig,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[dict], float, float]:
+    adjacencies = _detect_edge_adjacencies(polygons, piece_ids, config)
+    requested_gap = max(0.0, config.placement_gap_mm)
+    maximum_gap = max(requested_gap, config.max_placement_gap_mm)
+    gaps = np.arange(requested_gap, maximum_gap + 0.001, 0.25)
+    if len(gaps) == 0:
+        gaps = np.array([0.0])
+
+    for gap in gaps:
+        offsets = _placement_offsets(polygons, width, height, float(gap))
+        placed = [polygon + offset for polygon, offset in zip(polygons, offsets)]
+        overlap_area = _raster_overlap_area_mm2(placed)
+        checked_adjacencies = _adjacency_vertex_distances(placed, adjacencies)
+        vertices_valid = all(
+            adjacency["max_corresponding_vertex_distance_mm"]
+            <= config.max_adjacent_vertex_distance_mm
+            for adjacency in checked_adjacencies
+        )
+        if overlap_area <= config.final_overlap_tolerance_mm2 and vertices_valid:
+            return placed, offsets, checked_adjacencies, float(gap), overlap_area
+
+    raise RuntimeError(
+        "A geometric assembly was found, but no safe non-overlapping placement "
+        "satisfied the adjacent-vertex distance limit"
+    )
 
 
 def solve_puzzle(
@@ -354,6 +697,7 @@ def solve_puzzle(
     piece_ids: Sequence[str] | None = None,
     target_origin_mm: Sequence[float] = (0.0, 0.0),
     config: SolverConfig | None = None,
+    edge_profiles: Sequence[Sequence[ArrayLike]] | None = None,
 ) -> dict:
     """Solve polygons into a landscape rectangle and return rigid target poses.
 
@@ -366,6 +710,23 @@ def solve_puzzle(
     ids = list(piece_ids) if piece_ids is not None else [str(i) for i in range(len(arrays))]
     if len(ids) != len(arrays):
         raise ValueError("piece_ids and polygons must have the same length")
+    validated_profiles: list[list[np.ndarray]] | None = None
+    if edge_profiles is not None:
+        if len(edge_profiles) != len(arrays):
+            raise ValueError("edge_profiles and polygons must have the same length")
+        validated_profiles = []
+        for piece_index, (piece_profiles, polygon) in enumerate(zip(edge_profiles, arrays)):
+            if len(piece_profiles) != len(polygon):
+                raise ValueError(
+                    f"Piece {piece_index} must provide one edge profile per polygon edge"
+                )
+            checked_piece: list[np.ndarray] = []
+            for profile in piece_profiles:
+                array = np.asarray(profile, dtype=float)
+                if array.ndim != 2 or array.shape[0] < 2 or array.shape[1] != 3:
+                    raise ValueError("Each edge profile must be an N x 3 LAB array")
+                checked_piece.append(array)
+            validated_profiles.append(checked_piece)
     origin = np.asarray(target_origin_mm, dtype=float)
     if origin.shape != (2,):
         raise ValueError("target_origin_mm must contain exactly two values")
@@ -376,31 +737,121 @@ def solve_puzzle(
 
     all_solutions: list[tuple[float, float, float, list[PoseCandidate], dict]] = []
     total_nodes = 0
+    solve_started = time.monotonic()
+    deadline = (
+        solve_started + config.max_solve_seconds
+        if config.max_solve_seconds > 0.0
+        else None
+    )
+    search_timed_out = False
     for width, height, dimension_error in rectangles:
-        solutions, nodes = _search_rectangle(
-            arrays, width, height, dimension_error, config
+        if deadline is not None and time.monotonic() >= deadline:
+            search_timed_out = True
+            break
+        solutions, nodes, rectangle_timed_out = _search_rectangle(
+            arrays, width, height, dimension_error, config, deadline
         )
         total_nodes += nodes
         for score, poses, metrics in solutions:
             all_solutions.append((score, width, height, poses, metrics))
         if all_solutions and all_solutions[0][0] <= 0.005:
             break
+        if rectangle_timed_out:
+            search_timed_out = True
+            break
         all_solutions.sort(key=lambda item: item[0])
 
     if not all_solutions:
+        if search_timed_out:
+            raise RuntimeError(
+                f"Puzzle search exceeded its {config.max_solve_seconds:.1f} second time budget"
+            )
         raise RuntimeError(
             "No valid assembly found. Check polygon calibration, dimension ranges, "
             "or increase the hole/area tolerances."
         )
 
-    all_solutions.sort(key=lambda item: item[0])
-    score, width, height, poses, metrics = all_solutions[0]
+    evaluated_solutions = []
+    for score, width, height, poses, metrics in sorted(all_solutions, key=lambda item: item[0]):
+        assembled_polygons = [pose.polygon for pose in poses]
+        try:
+            (
+                placed_polygons,
+                placement_offsets,
+                adjacencies,
+                applied_gap_mm,
+                final_overlap_area_mm2,
+            ) = _apply_safe_placement_gap(
+                assembled_polygons,
+                ids,
+                width,
+                height,
+                config,
+            )
+        except RuntimeError:
+            continue
+
+        connected = _assembly_is_connected(len(arrays), adjacencies)
+        if config.require_connected_assembly and not connected:
+            continue
+        adjacencies, pattern_mismatch, pattern_evidence = _score_edge_patterns(
+            adjacencies, validated_profiles
+        )
+        if (
+            pattern_evidence >= config.min_pattern_evidence
+            and pattern_mismatch > config.max_pattern_mismatch
+        ):
+            continue
+        ranked_score = score + config.pattern_score_weight * pattern_mismatch
+        evaluated_solutions.append(
+            (
+                ranked_score,
+                score,
+                width,
+                height,
+                poses,
+                metrics,
+                placed_polygons,
+                placement_offsets,
+                adjacencies,
+                applied_gap_mm,
+                final_overlap_area_mm2,
+                connected,
+                pattern_mismatch,
+                pattern_evidence,
+            )
+        )
+
+    if not evaluated_solutions:
+        raise RuntimeError(
+            "Geometric candidates were found, but none satisfied connectivity, "
+            "non-overlap, adjacent-vertex, and visible-pattern constraints"
+        )
+
+    (
+        _,
+        score,
+        width,
+        height,
+        poses,
+        metrics,
+        placed_polygons,
+        placement_offsets,
+        adjacencies,
+        applied_gap_mm,
+        final_overlap_area_mm2,
+        connected,
+        pattern_mismatch,
+        pattern_evidence,
+    ) = min(evaluated_solutions, key=lambda item: item[0])
     output_pieces = []
-    for piece_id, pose in zip(ids, poses):
+    for piece_id, pose, placed_polygon, placement_offset in zip(
+        ids, poses, placed_polygons, placement_offsets
+    ):
         cosine, sine = math.cos(pose.rotation_rad), math.sin(pose.rotation_rad)
         rotation = np.array([[cosine, -sine], [sine, cosine]])
-        absolute_translation = np.asarray(pose.translation) + origin
-        absolute_polygon = pose.polygon + origin
+        absolute_translation = np.asarray(pose.translation) + placement_offset + origin
+        absolute_polygon = placed_polygon + origin
         output_pieces.append(
             {
                 "id": piece_id,
@@ -410,6 +861,7 @@ def solve_puzzle(
                 "target_polygon_mm": absolute_polygon.tolist(),
                 "boundary_side": pose.boundary_side,
                 "source_edge": pose.source_edge,
+                "safety_offset_mm": placement_offset.tolist(),
             }
         )
 
@@ -420,8 +872,26 @@ def solve_puzzle(
             "height_mm": height,
         },
         "score": score,
-        "metrics": {**metrics, "total_search_nodes": total_nodes},
+        "metrics": {
+            **metrics,
+            "total_search_nodes": total_nodes,
+            "applied_placement_gap_mm": applied_gap_mm,
+            "final_overlap_area_mm2": final_overlap_area_mm2,
+            "max_adjacent_vertex_distance_mm": max(
+                (
+                    adjacency["max_corresponding_vertex_distance_mm"]
+                    for adjacency in adjacencies
+                ),
+                default=0.0,
+            ),
+            "assembly_connected": connected,
+            "pattern_mismatch": pattern_mismatch,
+            "pattern_evidence": pattern_evidence,
+            "solve_elapsed_seconds": time.monotonic() - solve_started,
+            "search_timed_out": search_timed_out,
+        },
         "pieces": output_pieces,
+        "adjacencies": adjacencies,
         "config": asdict(config),
     }
 

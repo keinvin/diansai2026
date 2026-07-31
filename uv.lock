@@ -13,15 +13,21 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fashionstar-uart-sdk" },
+    { name = "gpiod" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "opencv-python" },
+    { name = "pyside6-essentials" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "fashionstar-uart-sdk", specifier = ">=1.3.12" },
+    { name = "gpiod", specifier = "==1.5.4" },
     { name = "numpy", specifier = ">=2.0.2" },
+    { name = "opencv-python", specifier = "==5.0.0.93" },
+    { name = "pyside6-essentials", specifier = "==6.6.3" },
 ]
 
 [[package]]
@@ -34,6 +40,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/da/2f/668fefb2bbea2e4e510b02a765c0f9aead0ac581f212814af0a3a27bb03e/fashionstar_uart_sdk-1.3.12.tar.gz", hash = "sha256:ea397f881a66fc547c1c9f573eede86b8f11e80b6cf605e66449024e6ec2b562", size = 14150, upload-time = "2026-06-05T04:32:50.275Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/93/68/9250da05e1a540e76c9d72fe3bcbefe7c5f8cf9c82a799e8728f0c28aaaa/fashionstar_uart_sdk-1.3.12-py3-none-any.whl", hash = "sha256:1c510512bc2a485a562084eb60570527b92231626b2ab36dd97292467241ebed", size = 14827, upload-time = "2026-06-05T04:32:48.897Z" },
+]
+
+[[package]]
+name = "gpiod"
+version = "1.5.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7f/19/ace9087a595ebd6e522c322ee0b254512f687f6456e58fc7245602ac8f38/gpiod-1.5.4.tar.gz", hash = "sha256:d8e4daa655dee75c33a49f5859b2e36c72385021c06c5552968294b1ad5c2dd0", size = 32356, upload-time = "2023-04-23T10:21:14.894Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/04/a89e22b48d88f1f8ba5ae69ba93e71ceb3be69c68368835399d97d21d40b/gpiod-1.5.4-py3-none-any.whl", hash = "sha256:7bb55dedda1987326516e08730adcf233e44548b0e27ec11f967060fd0229bb9", size = 30289, upload-time = "2023-04-23T10:21:11.991Z" },
 ]
 
 [[package]]
@@ -238,10 +253,56 @@ wheels = [
 ]
 
 [[package]]
+name = "opencv-python"
+version = "5.0.0.93"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/79/4c/a438d23e09ce2033c09f7b784ad2fbdb0adf529e434101ed28f142226f98/opencv_python-5.0.0.93.tar.gz", hash = "sha256:66aac3e5b5faa48d4025816592f3af19e4bfc2c68dec067bae2dbb4ca10aa9e2", size = 81802749, upload-time = "2026-07-02T06:59:53.815Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9c/75/76f6ade78f6102c61034f828e2a22616708df2c9504bc8d6af9dd8f73dc5/opencv_python-5.0.0.93-cp37-abi3-macosx_13_0_arm64.whl", hash = "sha256:198a75138241810206a17c829dbcc40a7cb1841cda538ca86cbbfc6c7d95f898", size = 48322443, upload-time = "2026-07-02T05:50:25.466Z" },
+    { url = "https://files.pythonhosted.org/packages/15/8c/bc1bda6aae69a32e9d84fc34153ba104cd25226861eb4aea33b2cea4860d/opencv_python-5.0.0.93-cp37-abi3-macosx_14_0_x86_64.whl", hash = "sha256:6bbc32f59e1b1a7db7b39c81f63d00625f041d333037fd8702f6da52cc39108b", size = 34782755, upload-time = "2026-07-02T05:51:30.556Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/8a/b04776ec45d2dea08a1b176f1829201db3515d4ed16c35f8fcc9fa7beb16/opencv_python-5.0.0.93-cp37-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:e2b4272e736836f66c2d176e43ab8101f3a00d45654916399f52e150c58981ac", size = 50614064, upload-time = "2026-07-02T06:53:22.604Z" },
+    { url = "https://files.pythonhosted.org/packages/95/54/eb47866b94f2b5b42dde17644b78055ef1ee05aae59962c7290e55270803/opencv_python-5.0.0.93-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f8b6d0a212253dd26ad338c812f1f23ca118fdf05a9c8c6b9444f161aa8c5881", size = 71064711, upload-time = "2026-07-02T06:54:13.148Z" },
+    { url = "https://files.pythonhosted.org/packages/93/da/962579f1e703cbf8c5422fd1f576467dcb3b5b0b0b81c1471c979764353a/opencv_python-5.0.0.93-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:08d5d91d967b58d6db86073b2ad3eaef88ca4ebdfd45c9059bf59f5ded0c7ad2", size = 49798576, upload-time = "2026-07-02T06:54:33.781Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/4c/c73f828fdbcd37eaf21d08fa852544a3ca7c2dbb3ea76873d64f2ea413d1/opencv_python-5.0.0.93-cp37-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:c8de2dec111122a02e8beb28e16c31904992dfd6186560b142a92c71403c1039", size = 73783032, upload-time = "2026-07-02T06:55:03.415Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/4b/edaf83b996ca5a1a3d8ccad485706b9c6d4742b13b9c4586bf1c1e7d9423/opencv_python-5.0.0.93-cp37-abi3-win32.whl", hash = "sha256:4b4b1a34c79bf8d3738e3cfe9a9e67b51a79663f6b692cbdad8c31f570da4157", size = 35564734, upload-time = "2026-07-02T05:49:57.704Z" },
+    { url = "https://files.pythonhosted.org/packages/21/f0/9fa6e85cb10c8eb36a0222d27e50fe381b86ce49a55446bf39f491727564/opencv_python-5.0.0.93-cp37-abi3-win_amd64.whl", hash = "sha256:f90ba04b8f73bc5c3814037699739f0156f597338a98f05956c684e7c3ca10d2", size = 44000345, upload-time = "2026-07-02T05:49:54.971Z" },
+]
+
+[[package]]
 name = "pyserial"
 version = "3.5"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/1e/7d/ae3f0a63f41e4d2f6cb66a5b57197850f919f59e558159a4dd3a818f5082/pyserial-3.5.tar.gz", hash = "sha256:3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb", size = 159125, upload-time = "2020-11-23T03:59:15.045Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629263eb51c2d8e9bcea4fc97826266d186f96f558/pyserial-3.5-py2.py3-none-any.whl", hash = "sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0", size = 90585, upload-time = "2020-11-23T03:59:13.41Z" },
+]
+
+[[package]]
+name = "pyside6-essentials"
+version = "6.6.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "shiboken6" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/11/68/1d6ac2d72c9ccc3632424a8dc7c03d53e4bb6b82c9aca62fe848521b7a83/PySide6_Essentials-6.6.3-cp38-abi3-macosx_11_0_universal2.whl", hash = "sha256:7b15d4419ad506e3af13d5d417582089baf31c2bcc74ac53c10457db81e69a11", size = 142993901, upload-time = "2024-03-26T17:47:15.532Z" },
+    { url = "https://files.pythonhosted.org/packages/93/12/a5afa4ad3cc40625ef8432ce321a6d9d5406f0d1ae4a8cddee80f98c8597/PySide6_Essentials-6.6.3-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:d3553641712e2056808c1bf4504ac3343da9aeb671e33933d253e4e807f2eeaf", size = 80165416, upload-time = "2024-03-26T17:48:17.23Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/17/387469d2029db4b9a0a7a3cf7f0e87f100227792d67ff1ce790e4109726e/PySide6_Essentials-6.6.3-cp38-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:3f72f09f4971d6a376d1e29545c12dc13c78a6887e29f1c6034239c86fe65931", size = 64572995, upload-time = "2024-03-26T17:49:23.308Z" },
+    { url = "https://files.pythonhosted.org/packages/72/5e/84f70f643a9d4de4e302dad3906181ca6c186fed2cf432b22f04869bf290/PySide6_Essentials-6.6.3-cp38-abi3-win_amd64.whl", hash = "sha256:7bc9c7cb71dd24ac9631220ebed476801e2f2d3286be01a4cdf480539a3d1e5f", size = 75031889, upload-time = "2024-03-26T17:50:20.607Z" },
+]
+
+[[package]]
+name = "shiboken6"
+version = "6.6.3"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/04/bb/8818d367f5cb1eedc79f2a5dbecda36276345fa5ceb9f7e7ce333120957f/shiboken6-6.6.3-cp38-abi3-macosx_11_0_universal2.whl", hash = "sha256:67f980fec13fd9292be483b9fabfce6c3dc537a5aec196578793a4b7c49d3e96", size = 345898, upload-time = "2024-03-26T17:50:30.158Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/b3/afb282bbc6f94b4ffaf28c0575adcd7dc82f5cec85269c7bc8aea5c3c2b2/shiboken6-6.6.3-cp38-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:068bb9d9f49b70f36bbd673013e032ac6c9cde5f771b134bd04611330867d9d7", size = 171454, upload-time = "2024-03-26T17:50:32.78Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/90/5d22372b8f4078e87bd7c404cf8936f61c5173592de746e49f78536f27c0/shiboken6-6.6.3-cp38-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:eb547c61c3360eb9086365cf42e57b2548be44f1db48b930af5e074cc73ec5d1", size = 162403, upload-time = "2024-03-26T17:50:34.949Z" },
+    { url = "https://files.pythonhosted.org/packages/98/06/4f409d6f241f276ac3233023de12d34367af9cfb1bab76bbbdefa8da8182/shiboken6-6.6.3-cp38-abi3-win_amd64.whl", hash = "sha256:b99b090361db9a7cbd5f22019ad7915819b57aab2d5920f7591f344bcd66e6d2", size = 1068502, upload-time = "2024-03-26T17:50:37.689Z" },
 ]

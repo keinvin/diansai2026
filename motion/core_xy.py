@@ -185,6 +185,82 @@ class CoreXY:
             time.sleep(interval)
         raise GrblTimeout("等待运动完成超时，最后状态: {}".format(last_status))
 
+    @staticmethod
+    def _parse_status_report(report: str) -> tuple[str, dict[str, str]]:
+        """Parse ``<State|Key:Value|...>`` without assuming a fixed field set."""
+
+        if not report.startswith("<") or not report.endswith(">"):
+            raise ValueError("不是有效的 GRBL 状态报告: {}".format(report))
+        parts = report[1:-1].split("|")
+        state = parts[0]
+        fields: dict[str, str] = {}
+        for part in parts[1:]:
+            if ":" in part:
+                key, value = part.split(":", 1)
+                fields[key] = value
+        return state, fields
+
+    def wait_until_position(
+        self,
+        *,
+        x: float | None = None,
+        y: float | None = None,
+        z: float | None = None,
+        timeout: float = 30.0,
+        interval: float = 0.05,
+        tolerance: float = 0.05,
+    ) -> str:
+        """Wait for both planner Idle and the requested work position.
+
+        A status query immediately after a queued G-code command can briefly
+        report ``Idle`` before execution changes to ``Run``.  Checking ``WPos``
+        as well prevents that transient state from releasing the caller early.
+        """
+
+        targets = {index: value for index, value in enumerate((x, y, z)) if value is not None}
+        if not targets:
+            raise ValueError("至少需要一个目标轴坐标")
+        if timeout <= 0.0 or interval < 0.0 or tolerance < 0.0:
+            raise ValueError("timeout 必须大于 0，interval/tolerance 不能小于 0")
+
+        deadline = time.monotonic() + timeout
+        last_status = ""
+        last_position: tuple[float, ...] | None = None
+        while time.monotonic() < deadline:
+            last_status = self.status()
+            state, fields = self._parse_status_report(last_status)
+            if state.startswith("Alarm"):
+                raise GrblError(last_status)
+
+            encoded_position = fields.get("WPos")
+            if encoded_position is not None:
+                try:
+                    last_position = tuple(float(value) for value in encoded_position.split(","))
+                except ValueError:
+                    last_position = None
+            reached = (
+                last_position is not None
+                and len(last_position) >= 3
+                and all(
+                    abs(last_position[index] - float(target)) <= tolerance
+                    for index, target in targets.items()
+                )
+            )
+            if state == "Idle" and reached:
+                return last_status
+            time.sleep(interval)
+
+        expected = ", ".join(
+            "{}={:g}".format(axis, target)
+            for axis, target in zip("XYZ", (x, y, z))
+            if target is not None
+        )
+        raise GrblTimeout(
+            "等待到达目标位置超时（{}），最后位置: {}，最后状态: {}".format(
+                expected, last_position, last_status
+            )
+        )
+
     def run_file(self, path: str | Path, timeout_per_line: float = 5.0) -> None:
         """Stream a G-code file using GRBL's reliable send-response protocol."""
         for line_number, raw_line in enumerate(Path(path).read_text().splitlines(), start=1):
@@ -233,7 +309,10 @@ def main() -> None:
             move = machine.move_by if args.relative else machine.move_to
             print(*move(args.x, args.y, args.z, args.feed, args.rapid), sep="\n")
             if args.wait:
-                print(machine.wait_until_idle())
+                if args.relative:
+                    print(machine.wait_until_idle())
+                else:
+                    print(machine.wait_until_position(x=args.x, y=args.y, z=args.z))
         elif args.action == "set-position":
             print(*machine.set_work_position(args.x, args.y, args.z), sep="\n")
         elif args.action == "run":

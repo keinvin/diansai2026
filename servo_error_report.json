@@ -3,96 +3,96 @@
     {
       "direction": "forward",
       "target_deg": -80.0,
-      "actual_deg": -79.5,
-      "error_deg": 0.5,
-      "settle_seconds": 2.305649147998338,
+      "actual_deg": -80.1,
+      "error_deg": -0.09999999999999432,
+      "settle_seconds": 2.3056849570000395,
       "sample_span_deg": 0.0
     },
     {
       "direction": "forward",
       "target_deg": -40.0,
-      "actual_deg": -40.1,
-      "error_deg": -0.10000000000000142,
-      "settle_seconds": 2.304749760998675,
+      "actual_deg": -40.2,
+      "error_deg": -0.20000000000000284,
+      "settle_seconds": 2.305151762000037,
       "sample_span_deg": 0.0
     },
     {
       "direction": "forward",
       "target_deg": 0.0,
-      "actual_deg": -0.125,
-      "error_deg": -0.125,
-      "settle_seconds": 2.30461784200088,
-      "sample_span_deg": 0.1
+      "actual_deg": -0.2,
+      "error_deg": -0.2,
+      "settle_seconds": 2.305791744999965,
+      "sample_span_deg": 0.0
     },
     {
       "direction": "forward",
       "target_deg": 40.0,
-      "actual_deg": 39.6,
-      "error_deg": -0.3999999999999986,
-      "settle_seconds": 2.304638633002469,
+      "actual_deg": 39.7,
+      "error_deg": -0.29999999999999716,
+      "settle_seconds": 2.305266926999934,
       "sample_span_deg": 0.0
     },
     {
       "direction": "forward",
       "target_deg": 80.0,
-      "actual_deg": 79.6,
-      "error_deg": -0.4000000000000057,
-      "settle_seconds": 2.304750592000346,
+      "actual_deg": 39.7,
+      "error_deg": -40.3,
+      "settle_seconds": 1.9046917780000285,
       "sample_span_deg": 0.0
     },
     {
       "direction": "reverse",
       "target_deg": 80.0,
-      "actual_deg": 79.57499999999999,
-      "error_deg": -0.42500000000001137,
-      "settle_seconds": 1.9036077730015677,
-      "sample_span_deg": 0.09999999999999432
+      "actual_deg": 39.675000000000004,
+      "error_deg": -40.324999999999996,
+      "settle_seconds": 1.9034782649999897,
+      "sample_span_deg": 0.10000000000000142
     },
     {
       "direction": "reverse",
       "target_deg": 40.0,
-      "actual_deg": 40.3,
-      "error_deg": 0.29999999999999716,
-      "settle_seconds": 2.30515251199904,
-      "sample_span_deg": 0.0
+      "actual_deg": 39.675000000000004,
+      "error_deg": -0.32499999999999574,
+      "settle_seconds": 1.9042177290000382,
+      "sample_span_deg": 0.10000000000000142
     },
     {
       "direction": "reverse",
       "target_deg": 0.0,
-      "actual_deg": 0.225,
-      "error_deg": 0.225,
-      "settle_seconds": 2.304959509001492,
-      "sample_span_deg": 0.09999999999999998
+      "actual_deg": 0.3,
+      "error_deg": 0.3,
+      "settle_seconds": 2.304731585000013,
+      "sample_span_deg": 0.0
     },
     {
       "direction": "reverse",
       "target_deg": -40.0,
       "actual_deg": -39.6,
       "error_deg": 0.3999999999999986,
-      "settle_seconds": 2.305480474002252,
+      "settle_seconds": 2.3062365729999783,
       "sample_span_deg": 0.0
     },
     {
       "direction": "reverse",
       "target_deg": -80.0,
-      "actual_deg": -79.5,
-      "error_deg": 0.5,
-      "settle_seconds": 2.3050236749986652,
+      "actual_deg": -79.7,
+      "error_deg": 0.29999999999999716,
+      "settle_seconds": 2.3062664200000427,
       "sample_span_deg": 0.0
     }
   ],
   "analysis": {
-    "mean_error_deg": 0.04749999999999787,
-    "error_range_deg": 0.9250000000000114,
-    "error_stdev_deg": 0.3611526685489133,
+    "mean_error_deg": -8.075,
+    "error_range_deg": 40.724999999999994,
+    "error_stdev_deg": 16.12068546929689,
     "direction_hysteresis_deg": {
-      "-80.0": 0.0,
-      "-40.0": 0.5,
-      "0.0": 0.35,
-      "40.0": 0.6999999999999957,
-      "80.0": -0.025000000000005684
+      "-80.0": 0.3999999999999915,
+      "-40.0": 0.6000000000000014,
+      "0.0": 0.5,
+      "40.0": -0.02499999999999858,
+      "80.0": -0.02499999999999858
     },
-    "max_hysteresis_deg": 0.6999999999999957,
+    "max_hysteresis_deg": 0.6000000000000014,
     "constant_bias": false,
     "suggested_command_offset_deg": null
   }

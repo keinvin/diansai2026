@@ -9,6 +9,94 @@ CV2_AVAILABLE = importlib.util.find_spec("cv2") is not None
 
 @unittest.skipUnless(CV2_AVAILABLE, "OpenCV is not installed")
 class VisionTest(unittest.TestCase):
+    def test_rounded_card_corner_pair_becomes_one_corner(self):
+        from puzzle_solver.vision import _merge_rounded_corner_vertices
+
+        polygon = np.asarray(
+            [[3.0, 0.0], [47.0, 0.0], [50.0, 3.0], [50.0, 30.0], [0.0, 30.0], [0.0, 3.0]]
+        )
+        cleaned = _merge_rounded_corner_vertices(polygon, 8.0)
+        self.assertEqual(len(cleaned), 4)
+        expected = np.asarray([[0.0, 0.0], [50.0, 0.0], [50.0, 30.0], [0.0, 30.0]])
+        for corner in expected:
+            self.assertTrue(np.any(np.all(np.isclose(cleaned, corner), axis=1)))
+
+    def test_legal_ten_millimetre_edge_is_not_rounded_corner(self):
+        from puzzle_solver.vision import _merge_rounded_corner_vertices
+
+        polygon = np.asarray(
+            [[0.0, 0.0], [10.0, 0.0], [20.0, 10.0], [20.0, 30.0], [0.0, 30.0]]
+        )
+        cleaned = _merge_rounded_corner_vertices(polygon, 8.0)
+        self.assertEqual(len(cleaned), 5)
+
+    def test_rounded_piece_detection_returns_four_corners(self):
+        import cv2
+
+        from puzzle_solver.vision import Calibration, VisionConfig, detect_pieces
+
+        pixels_per_mm = 4
+        image = np.full((220, 300, 3), (155, 85, 35), dtype=np.uint8)
+        rounded_mm = np.asarray(
+            [[13, 10], [57, 10], [60, 13], [60, 40], [10, 40], [10, 13]],
+            dtype=np.int32,
+        )
+        cv2.fillPoly(image, [rounded_mm * pixels_per_mm], (245, 245, 245))
+        calibration = Calibration.from_dict(
+            {
+                "mm_per_pixel": 1.0 / pixels_per_mm,
+                "roi_polygon_px": [[0, 0], [299, 0], [299, 219], [0, 219]],
+            },
+            image.shape,
+        )
+        result = detect_pieces(
+            image,
+            calibration,
+            VisionConfig(
+                morphology_kernel_px=3,
+                min_piece_area_mm2=100.0,
+                rounded_corner_max_chord_mm=8.0,
+            ),
+        )
+        self.assertEqual(len(result.pieces), 1)
+        self.assertEqual(len(result.pieces[0].polygon_mm), 4)
+
+    def test_nearly_straight_false_vertex_is_removed(self):
+        from puzzle_solver.vision import _remove_nearly_straight_vertices
+
+        polygon = np.asarray(
+            [[0.0, 0.0], [10.0, 0.5], [20.0, 0.0], [20.0, 10.0], [0.0, 10.0]]
+        )
+        cleaned = _remove_nearly_straight_vertices(polygon, 170.0, 20.0)
+        self.assertEqual(len(cleaned), 4)
+        self.assertFalse(np.any(np.all(np.isclose(cleaned, [10.0, 0.5]), axis=1)))
+
+    def test_real_corner_below_angle_threshold_is_retained(self):
+        from puzzle_solver.vision import _remove_nearly_straight_vertices
+
+        polygon = np.asarray(
+            [[0.0, 0.0], [10.0, 1.8], [20.0, 0.0], [20.0, 10.0], [0.0, 10.0]]
+        )
+        cleaned = _remove_nearly_straight_vertices(polygon, 170.0, 20.0)
+        self.assertEqual(len(cleaned), 5)
+
+    def test_shallow_corner_between_long_edges_is_retained(self):
+        from puzzle_solver.vision import _remove_nearly_straight_vertices
+
+        # Reproduces the blue piece: the 172.9-degree V1 is shallow but both
+        # adjacent physical cut edges are much longer than 20 mm.
+        polygon = np.asarray(
+            [
+                [14.4, 217.4],
+                [59.7, 251.5],
+                [90.8, 269.3],
+                [111.4, 253.9],
+                [60.5, 182.0],
+            ]
+        )
+        cleaned = _remove_nearly_straight_vertices(polygon, 170.0, 20.0)
+        self.assertEqual(len(cleaned), 5)
+
     def test_synthetic_detection_and_solve(self):
         import cv2
 

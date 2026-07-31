@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- A4 template. Print at Actual Size / 100%; do not use Fit to Page. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm" viewBox="0 0 210 297">
+  <title>25 mm concentric circle and 40 mm square with centre lines</title>
+  <g fill="none" stroke="#000000" stroke-width="0.3" stroke-linecap="square" shape-rendering="geometricPrecision">
+    <!-- 40 × 40 mm square, centred at (105, 148.5) -->
+    <rect x="85" y="128.5" width="40" height="40"/>
+    <!-- Two orthogonal centre lines, forming the 田 grid -->
+    <path d="M105 128.5 V168.5 M85 148.5 H125"/>
+    <!-- 25 mm diameter circle, concentric with the square -->
+    <circle cx="105" cy="148.5" r="12.5"/>
+  </g>
+</svg>

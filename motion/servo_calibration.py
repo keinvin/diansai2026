@@ -146,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fashion Star servo multi-point error test")
     parser.add_argument("--port", default="/dev/ttyUSB1")
     parser.add_argument("--baudrate", type=int, default=115200)
-    parser.add_argument("--id", type=int, default=0, dest="servo_id")
+    parser.add_argument("--id", type=int, default=1, dest="servo_id")
     parser.add_argument(
         "--points",
         type=float,
