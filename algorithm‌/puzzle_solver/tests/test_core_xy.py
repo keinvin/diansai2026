@@ -42,6 +42,23 @@ class CoreXYPositionWaitTest(unittest.TestCase):
 
         self.assertEqual(machine.read_count, 1)
 
+    def test_machine_position_reports_use_cached_work_offset(self):
+        machine = StatusSequenceCoreXY(
+            [
+                "<Run|MPos:8.000,16.000,0.000|WCO:4.000,8.000,0.000>",
+                "<Idle|MPos:14.000,28.000,0.000>",
+            ]
+        )
+
+        result = machine.wait_until_position(
+            x=10.0,
+            y=20.0,
+            interval=0.0,
+        )
+
+        self.assertEqual(result, "<Idle|MPos:14.000,28.000,0.000>")
+        self.assertEqual(machine.read_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

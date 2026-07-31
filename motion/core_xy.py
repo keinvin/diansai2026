@@ -38,6 +38,7 @@ class CoreXY:
         self.baudrate = baudrate
         self.timeout = timeout
         self.uart: serial.Serial | None = None
+        self._work_coordinate_offset: tuple[float, ...] | None = None
 
     def open(self) -> "CoreXY":
         self.uart = serial.Serial(
@@ -115,6 +116,33 @@ class CoreXY:
             if response.startswith("<") and response.endswith(">"):
                 return response
         raise GrblTimeout("等待状态报告超时")
+
+    def soft_reset(self, timeout: float = 2.0) -> list[str]:
+        """Reset GRBL with realtime Ctrl-X and wait for its startup banner.
+
+        When invoked while Idle this does not move an axis. It also makes a
+        newly-written ``$1=0`` take effect immediately, releasing the stepper
+        enable output during hardware deinitialization.
+        """
+        if timeout <= 0:
+            raise ValueError("timeout 必须大于 0")
+        uart = self._require_uart()
+        uart.write(b"\x18")
+        uart.flush()
+
+        deadline = time.monotonic() + timeout
+        responses: list[str] = []
+        while time.monotonic() < deadline:
+            raw = uart.readline()
+            if not raw:
+                continue
+            response = raw.decode("ascii", errors="replace").strip()
+            if not response:
+                continue
+            responses.append(response)
+            if response.startswith("Grbl "):
+                return responses
+        raise GrblTimeout("等待 GRBL 软复位启动信息超时")
 
     @staticmethod
     def _axis_words(x: float | None, y: float | None, z: float | None) -> str:
@@ -232,12 +260,35 @@ class CoreXY:
             if state.startswith("Alarm"):
                 raise GrblError(last_status)
 
+            encoded_offset = fields.get("WCO")
+            if encoded_offset is not None:
+                try:
+                    offset = tuple(float(value) for value in encoded_offset.split(","))
+                    if len(offset) >= 3:
+                        self._work_coordinate_offset = offset
+                except ValueError:
+                    pass
+
             encoded_position = fields.get("WPos")
             if encoded_position is not None:
                 try:
                     last_position = tuple(float(value) for value in encoded_position.split(","))
                 except ValueError:
                     last_position = None
+            elif fields.get("MPos") is not None:
+                try:
+                    machine_position = tuple(
+                        float(value) for value in fields["MPos"].split(",")
+                    )
+                except ValueError:
+                    last_position = None
+                else:
+                    offset = getattr(self, "_work_coordinate_offset", None)
+                    if offset is not None and len(machine_position) >= 3:
+                        last_position = tuple(
+                            machine - origin
+                            for machine, origin in zip(machine_position, offset)
+                        )
             reached = (
                 last_position is not None
                 and len(last_position) >= 3

@@ -246,6 +246,14 @@ class CameraView(QWidget):
 
 
 class RecognitionWindow(QMainWindow):
+    def _save_document_fields(self, *keys: str) -> None:
+        """Persist UI-owned fields without overwriting newer hardware settings."""
+        latest = load_config()
+        for key in keys:
+            latest[key] = self._document[key]
+        save_config(latest)
+        self._document = latest
+
     def __init__(self, device: str, fullscreen: bool) -> None:
         super().__init__()
         self._document = load_config()
@@ -262,7 +270,9 @@ class RecognitionWindow(QMainWindow):
                 [self._corners[index].x(), self._corners[index].y()] for index in A4_FROM_SCREEN
             ]
             self._document["a4_corner_indices"] = [0, 1, 2, 3]
-            save_config(self._document)
+            self._save_document_fields(
+                "screen_a4_corners_px", "a4_corners_px", "a4_corner_indices"
+            )
         self._latest_frame: np.ndarray | None = None
         self._latest_solution: dict | None = None
         self._frozen = False
@@ -425,7 +435,7 @@ class RecognitionWindow(QMainWindow):
         self._document["a4_region"] = region
         # Keep this derived key for calibration consumers that use the old flag.
         self._document["use_a4_upper_half"] = region == "upper"
-        save_config(self._document)
+        self._save_document_fields("a4_region", "use_a4_upper_half")
         self._frozen = False
         self._latest_solution = None
         self._execute_button.setEnabled(False)
@@ -436,7 +446,7 @@ class RecognitionWindow(QMainWindow):
         if self._recognition_thread is not None or self._motion_thread is not None:
             return
         self._document["puzzle_search_enabled"] = bool(enabled)
-        save_config(self._document)
+        self._save_document_fields("puzzle_search_enabled")
         self._frozen = False
         self._latest_solution = None
         self._execute_button.setEnabled(False)
@@ -452,7 +462,9 @@ class RecognitionWindow(QMainWindow):
         self._document["a4_corners_px"] = []
         self._document["a4_corner_indices"] = []
         self._document["screen_a4_corners_px"] = []
-        save_config(self._document)
+        self._save_document_fields(
+            "a4_corners_px", "a4_corner_indices", "screen_a4_corners_px"
+        )
         self._details.clear()
         self._update_status()
 
@@ -476,7 +488,9 @@ class RecognitionWindow(QMainWindow):
         self._document["screen_a4_corners_px"] = screen_corners
         self._document["a4_corners_px"] = a4_corners
         self._document["a4_corner_indices"] = [0, 1, 2, 3]
-        save_config(self._document)
+        self._save_document_fields(
+            "screen_a4_corners_px", "a4_corners_px", "a4_corner_indices"
+        )
         self._frozen = False
         self._details.setText("已载入 red_a4_corners.json 的自动定位结果。")
         self._update_status()
@@ -504,7 +518,9 @@ class RecognitionWindow(QMainWindow):
         visible = [(a4_index, self._corners[screen_index]) for a4_index, screen_index in enumerate(A4_FROM_SCREEN) if self._corners[screen_index] is not None]
         self._document["a4_corners_px"] = [[round(point.x(), 2), round(point.y(), 2)] for _, point in visible]
         self._document["a4_corner_indices"] = [index for index, _ in visible]
-        save_config(self._document)
+        self._save_document_fields(
+            "screen_a4_corners_px", "a4_corners_px", "a4_corner_indices"
+        )
 
     def _update_status(self) -> None:
         complete = len(self._corners) == 4 and sum(point is not None for point in self._corners) >= 3

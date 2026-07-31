@@ -37,6 +37,10 @@ class FakeCoreXY:
         self.commands.append(("set_work_position", x, y, z))
         return ["ok"]
 
+    def soft_reset(self):
+        self.commands.append("soft_reset")
+        return ["Grbl 1.1"]
+
     def move_to(self, **kwargs):
         self.moves.append(kwargs)
         if self.event_log is not None:
@@ -271,6 +275,7 @@ class MotionPlanTest(unittest.TestCase):
                 "$1=255",
                 ("set_work_position", 0.0, 0.0, 0.0),
                 "$1=0",
+                "soft_reset",
             ],
         )
 

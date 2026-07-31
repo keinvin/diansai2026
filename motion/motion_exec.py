@@ -198,6 +198,7 @@ class MotionExecutor:
             and self.corexy.uart is not None
         ):
             cleanup(lambda: self.corexy.command("$1=0"))
+            cleanup(self.corexy.soft_reset)
         cleanup(self.corexy.close)
         self._grbl_initialized = False
 
