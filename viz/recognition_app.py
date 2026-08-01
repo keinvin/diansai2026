@@ -1143,8 +1143,13 @@ class RecognitionWindow(QMainWindow):
         else:
             rectangle = solution["rectangle"]
             target_region = "下半" if self._document.get("a4_region", "upper") == "upper" else "上半"
+            fallback_label = (
+                "最佳回退结果："
+                if solution["metrics"].get("best_effort_fallback_used", False)
+                else ""
+            )
             self._status.setText(
-                f"识别到 {len(result.pieces)} 块，已在 A4 {target_region}显示 "
+                f"识别到 {len(result.pieces)} 块，{fallback_label}已在 A4 {target_region}显示 "
                 f"{rectangle['width_mm']:.0f}×{rectangle['height_mm']:.0f} mm 矩形"
             )
         detail_lines = [
@@ -1164,6 +1169,22 @@ class RecognitionWindow(QMainWindow):
         elif not puzzle_search_enabled:
             detail_lines.append("拼图搜索已关闭：仅显示碎片轮廓和顶点。")
         elif solution is not None:
+            fallback_reasons = {
+                "search_timeout": "已达到搜索时间上限",
+                "geometry_tolerance": "几何误差超过常规容差",
+                "pattern_mismatch": "花纹连续性超过常规阈值",
+                "card_symmetry_mismatch": "整体花纹对称性超过常规阈值",
+                "trusted_corner_constraint": "圆角位置超过常规阈值",
+            }
+            if solution["metrics"].get("best_effort_fallback_used", False):
+                reasons = [
+                    fallback_reasons.get(reason, reason)
+                    for reason in solution["metrics"].get("best_effort_reasons", [])
+                ]
+                detail_lines.append(
+                    "严格条件无解，已采用评分最优且满足安全摆放约束的结果："
+                    + "、".join(reasons)
+                )
             pattern_evidence = solution["metrics"]["pattern_evidence"]
             if pattern_evidence >= solution["config"]["min_pattern_evidence"]:
                 pattern_line = "花纹不匹配度 {:.1%}（证据 {:.1%}）".format(

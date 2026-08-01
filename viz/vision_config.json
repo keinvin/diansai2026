@@ -39,7 +39,7 @@
     "approx_epsilon_perimeter_ratio": 0.0,
     "use_convex_hull": false,
     "min_detected_edge_mm": 0.0,
-    "rounded_corner_max_chord_mm": 5.0,
+    "rounded_corner_max_chord_mm": 7.0,
     "collinear_vertex_tolerance_mm": 1.5,
     "straight_vertex_angle_threshold_deg": 170.0,
     "straight_vertex_max_adjacent_edge_mm": 20.0,

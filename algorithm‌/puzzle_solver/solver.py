@@ -78,6 +78,13 @@ class SolverConfig:
     retry_max_hole_ratio: float = 0.06
     retry_max_overlap_ratio: float = 0.02
     retry_early_accept_score: float = 0.12
+    enable_best_effort_fallback: bool = True
+    best_effort_dimension_area_tolerance: float = 0.12
+    best_effort_inside_tolerance_mm: float = 8.0
+    best_effort_max_hole_ratio: float = 0.15
+    best_effort_max_overlap_ratio: float = 0.08
+    best_effort_candidate_evaluation_limit: int = 16
+    best_effort_safe_candidate_limit: int = 4
     use_native_search: bool = True
     native_search_required: bool = False
 
@@ -1177,8 +1184,11 @@ def _apply_safe_placement_gap(
     width: float,
     height: float,
     config: SolverConfig,
+    adjacencies: Sequence[dict] | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[dict], float, float, float, bool]:
-    adjacencies = _detect_edge_adjacencies(polygons, piece_ids, config)
+    adjacencies = list(adjacencies) if adjacencies is not None else _detect_edge_adjacencies(
+        polygons, piece_ids, config
+    )
     requested_gap = max(0.0, config.placement_gap_mm)
     maximum_gap = max(requested_gap, config.max_placement_gap_mm)
     gaps = np.arange(requested_gap, maximum_gap + 0.001, 0.25)
@@ -1242,6 +1252,205 @@ def _apply_safe_placement_gap(
     )
 
 
+def _evaluate_solution_candidates(
+    solutions: Sequence[tuple[float, float, float, list[PoseCandidate], dict]],
+    arrays: Sequence[np.ndarray],
+    ids: Sequence[str],
+    config: SolverConfig,
+    validated_profiles: Sequence[Sequence[np.ndarray]] | None,
+    validated_features: Sequence[dict] | None,
+    appearance_search_enabled: bool,
+    search_phase: str,
+    deadline: float | None,
+    bounded_evaluation: bool = False,
+) -> tuple[list[tuple], list[tuple], int, bool]:
+    """Validate one search phase and retain both normal and soft-fallback results."""
+
+    evaluated_solutions: list[tuple] = []
+    fallback_solutions: list[tuple] = []
+    scored_candidates = []
+    for score, width, height, poses, metrics in solutions:
+        card_symmetry_mismatch, card_symmetry_evidence, symmetry_details = (
+            _score_card_symmetry(poses, width, height, validated_features)
+        )
+        symmetry_violation = bool(
+            appearance_search_enabled
+            and card_symmetry_evidence >= config.min_card_symmetry_evidence
+            and card_symmetry_mismatch > config.max_card_symmetry_mismatch
+        )
+        scored_candidates.append(
+            (
+                symmetry_violation,
+                score
+                + config.card_symmetry_score_weight
+                * card_symmetry_mismatch
+                * card_symmetry_evidence,
+                score,
+                width,
+                height,
+                poses,
+                metrics,
+                card_symmetry_mismatch,
+                card_symmetry_evidence,
+                symmetry_details,
+            )
+        )
+
+    best_effort_search_used = search_phase == "best_effort"
+    limited_evaluation = best_effort_search_used or bounded_evaluation
+    best_effort_evaluation_count = 0
+    evaluation_timed_out = False
+    for (
+        symmetry_violation,
+        _,
+        score,
+        width,
+        height,
+        poses,
+        metrics,
+        card_symmetry_mismatch,
+        card_symmetry_evidence,
+        symmetry_details,
+    ) in sorted(scored_candidates, key=lambda item: (item[0], item[1])):
+        if deadline is not None and time.monotonic() >= deadline:
+            evaluation_timed_out = True
+            break
+        if (
+            symmetry_violation
+            and not best_effort_search_used
+            and (evaluated_solutions or fallback_solutions)
+        ):
+            break
+        assembled_polygons = [pose.polygon for pose in poses]
+        initial_adjacencies = _detect_edge_adjacencies(
+            assembled_polygons, ids, config
+        )
+        connected = _assembly_is_connected(len(arrays), initial_adjacencies)
+        if config.require_connected_assembly and not connected:
+            continue
+        if limited_evaluation or symmetry_violation:
+            if best_effort_evaluation_count >= max(
+                1, config.best_effort_candidate_evaluation_limit
+            ):
+                break
+            best_effort_evaluation_count += 1
+        try:
+            (
+                placed_polygons,
+                placement_offsets,
+                adjacencies,
+                applied_gap_mm,
+                final_overlap_area_mm2,
+                achieved_gap_mm,
+                gap_satisfied,
+            ) = _apply_safe_placement_gap(
+                assembled_polygons,
+                ids,
+                width,
+                height,
+                config,
+                initial_adjacencies,
+            )
+        except RuntimeError:
+            continue
+
+        adjacencies, pattern_mismatch, pattern_evidence = _score_edge_patterns(
+            adjacencies, validated_profiles
+        )
+        (
+            rounded_corner_mismatch,
+            rounded_corner_evidence,
+            corner_mark_mismatch,
+            corner_mark_evidence,
+            card_feature_details,
+        ) = _score_card_features(
+            poses, width, height, validated_features, config=config
+        )
+        fallback_reasons: list[str] = []
+        constraint_penalty = 0.0
+        if symmetry_violation:
+            fallback_reasons.append("card_symmetry_mismatch")
+            constraint_penalty += (
+                card_symmetry_mismatch - config.max_card_symmetry_mismatch
+            ) / max(config.max_card_symmetry_mismatch, 0.05)
+        if (
+            pattern_evidence >= config.min_pattern_evidence
+            and pattern_mismatch > config.max_pattern_mismatch
+        ):
+            fallback_reasons.append("pattern_mismatch")
+            constraint_penalty += (
+                pattern_mismatch - config.max_pattern_mismatch
+            ) / max(config.max_pattern_mismatch, 0.05)
+        if _violates_trusted_corner_constraint(card_feature_details, config):
+            fallback_reasons.append("trusted_corner_constraint")
+            constraint_penalty += float(
+                card_feature_details.get("misplaced_rounded_corner_count", 0)
+            ) / max(config.min_misplaced_trusted_corner_count, 1)
+        ranked_score = (
+            score
+            + max(0.0, config.placement_gap_mm - achieved_gap_mm)
+            / max(config.placement_gap_mm, 1e-6)
+            + config.pattern_score_weight * pattern_mismatch * pattern_evidence
+            + config.rounded_corner_score_weight
+            * rounded_corner_mismatch
+            * rounded_corner_evidence
+            + config.corner_mark_score_weight
+            * corner_mark_mismatch
+            * corner_mark_evidence
+            + config.card_symmetry_score_weight
+            * card_symmetry_mismatch
+            * card_symmetry_evidence
+            + 2.0 * constraint_penalty
+        )
+        evaluated = (
+            ranked_score,
+            score,
+            width,
+            height,
+            poses,
+            metrics,
+            placed_polygons,
+            placement_offsets,
+            adjacencies,
+            applied_gap_mm,
+            final_overlap_area_mm2,
+            achieved_gap_mm,
+            gap_satisfied,
+            connected,
+            pattern_mismatch,
+            pattern_evidence,
+            rounded_corner_mismatch,
+            rounded_corner_evidence,
+            corner_mark_mismatch,
+            corner_mark_evidence,
+            card_feature_details,
+            card_symmetry_mismatch,
+            card_symmetry_evidence,
+            symmetry_details,
+            fallback_reasons,
+            search_phase,
+        )
+        if fallback_reasons:
+            fallback_solutions.append(evaluated)
+        else:
+            evaluated_solutions.append(evaluated)
+        if (
+            (limited_evaluation or symmetry_violation)
+            and len(evaluated_solutions) + len(fallback_solutions)
+            >= max(1, config.best_effort_safe_candidate_limit)
+        ):
+            break
+
+    if deadline is not None and time.monotonic() >= deadline:
+        evaluation_timed_out = True
+    return (
+        evaluated_solutions,
+        fallback_solutions,
+        best_effort_evaluation_count,
+        evaluation_timed_out,
+    )
+
+
 def solve_puzzle(
     polygons: Sequence[ArrayLike],
     piece_ids: Sequence[str] | None = None,
@@ -1302,7 +1511,6 @@ def solve_puzzle(
     if origin.shape != (2,):
         raise ValueError("target_origin_mm must contain exactly two values")
 
-    all_solutions: list[tuple[float, float, float, list[PoseCandidate], dict]] = []
     total_nodes = 0
     solve_started = time.monotonic()
     deadline = (
@@ -1312,7 +1520,6 @@ def solve_puzzle(
     )
     search_timed_out = False
     rectangle_candidates_found = False
-    relaxed_search_used = False
     base_search_config = config
     if appearance_search_enabled:
         base_search_config = replace(
@@ -1322,7 +1529,7 @@ def solve_puzzle(
                 config.pattern_max_solutions_per_rectangle,
             ),
         )
-    search_configs: list[tuple[SolverConfig, bool]] = [(base_search_config, False)]
+    search_configs: list[tuple[SolverConfig, str]] = [(base_search_config, "strict")]
     if config.enable_relaxed_retry:
         relaxed_config = replace(
             base_search_config,
@@ -1342,13 +1549,56 @@ def solve_puzzle(
             ),
             enable_relaxed_retry=False,
         )
-        relaxed_phase = (relaxed_config, True)
+        relaxed_phase = (relaxed_config, "relaxed")
         if config.relaxed_search_first:
             search_configs.insert(0, relaxed_phase)
         else:
             search_configs.append(relaxed_phase)
 
-    for search_config, phase_is_relaxed in search_configs:
+    if config.enable_best_effort_fallback:
+        search_configs.append(
+            (
+                replace(
+                    base_search_config,
+                    dimension_area_tolerance=max(
+                        config.dimension_area_tolerance,
+                        config.retry_dimension_area_tolerance,
+                        config.best_effort_dimension_area_tolerance,
+                    ),
+                    inside_tolerance_mm=max(
+                        config.inside_tolerance_mm,
+                        config.retry_inside_tolerance_mm,
+                        config.best_effort_inside_tolerance_mm,
+                    ),
+                    max_hole_ratio=max(
+                        config.max_hole_ratio,
+                        config.retry_max_hole_ratio,
+                        config.best_effort_max_hole_ratio,
+                    ),
+                    max_overlap_ratio=max(
+                        config.max_overlap_ratio,
+                        config.retry_max_overlap_ratio,
+                        config.best_effort_max_overlap_ratio,
+                    ),
+                    early_accept_score=max(
+                        config.early_accept_score,
+                        config.retry_early_accept_score,
+                    ),
+                    enable_relaxed_retry=False,
+                    enable_best_effort_fallback=False,
+                ),
+                "best_effort",
+            )
+        )
+
+    evaluated_solutions: list[tuple] = []
+    fallback_solutions: list[tuple] = []
+    geometric_candidates_found = False
+    best_effort_evaluation_count = 0
+    for search_config, search_phase in search_configs:
+        phase_solutions: list[
+            tuple[float, float, float, list[PoseCandidate], dict]
+        ] = []
         rectangles = candidate_rectangles(arrays, search_config)
         rectangle_candidates_found |= bool(rectangles)
         solved_rectangle_count = 0
@@ -1361,144 +1611,77 @@ def solve_puzzle(
             )
             total_nodes += nodes
             for score, poses, metrics in solutions:
-                all_solutions.append((score, width, height, poses, metrics))
+                phase_solutions.append((score, width, height, poses, metrics))
             if solutions:
                 solved_rectangle_count += 1
-            all_solutions.sort(key=lambda item: item[0])
+            phase_solutions.sort(key=lambda item: item[0])
             if (
                 appearance_search_enabled
                 and solved_rectangle_count >= max(1, config.pattern_rectangle_candidates)
             ):
                 break
             if (
-                all_solutions
+                phase_solutions
                 and not appearance_search_enabled
                 and search_config.early_accept_score > 0.0
-                and all_solutions[0][0] <= search_config.early_accept_score
+                and phase_solutions[0][0] <= search_config.early_accept_score
             ):
                 break
             if rectangle_timed_out:
                 search_timed_out = True
                 break
-        if all_solutions:
-            relaxed_search_used = phase_is_relaxed
-            break
+        if phase_solutions:
+            geometric_candidates_found = True
+            (
+                phase_evaluated,
+                phase_fallback,
+                phase_evaluation_count,
+                evaluation_timed_out,
+            ) = _evaluate_solution_candidates(
+                phase_solutions,
+                arrays,
+                ids,
+                config,
+                validated_profiles,
+                validated_features,
+                appearance_search_enabled,
+                search_phase,
+                None if search_timed_out else deadline,
+                bounded_evaluation=search_timed_out,
+            )
+            best_effort_evaluation_count += phase_evaluation_count
+            fallback_solutions.extend(phase_fallback)
+            if phase_evaluated:
+                evaluated_solutions = phase_evaluated
+                search_timed_out |= evaluation_timed_out
+                break
+            if evaluation_timed_out:
+                search_timed_out = True
         if search_timed_out:
             break
 
-    if not all_solutions:
+    if (
+        not evaluated_solutions
+        and config.enable_best_effort_fallback
+        and fallback_solutions
+    ):
+        evaluated_solutions = fallback_solutions
+
+    if not evaluated_solutions:
         if search_timed_out:
             raise RuntimeError(
-                f"Puzzle search exceeded its {config.max_solve_seconds:.1f} second time budget"
+                f"Puzzle search reached its {config.max_solve_seconds:.1f} second time "
+                "budget without a safe candidate"
             )
         if not rectangle_candidates_found:
             raise RuntimeError("No rectangle dimensions satisfy the configured ranges")
-        raise RuntimeError(
-            "No valid assembly found. Check polygon calibration, dimension ranges, "
-            "or increase the hole/area tolerances."
-        )
-
-    evaluated_solutions = []
-    for score, width, height, poses, metrics in sorted(all_solutions, key=lambda item: item[0]):
-        card_symmetry_mismatch, card_symmetry_evidence, symmetry_details = (
-            _score_card_symmetry(poses, width, height, validated_features)
-        )
-        if (
-            appearance_search_enabled
-            and card_symmetry_evidence >= config.min_card_symmetry_evidence
-            and card_symmetry_mismatch > config.max_card_symmetry_mismatch
-        ):
-            continue
-        assembled_polygons = [pose.polygon for pose in poses]
-        try:
-            (
-                placed_polygons,
-                placement_offsets,
-                adjacencies,
-                applied_gap_mm,
-                final_overlap_area_mm2,
-                achieved_gap_mm,
-                gap_satisfied,
-            ) = _apply_safe_placement_gap(
-                assembled_polygons,
-                ids,
-                width,
-                height,
-                config,
+        if geometric_candidates_found:
+            raise RuntimeError(
+                "Geometric candidates were found in every enabled search phase, but "
+                "none satisfied connectivity, non-overlap, and adjacent-vertex constraints"
             )
-        except RuntimeError:
-            continue
-
-        connected = _assembly_is_connected(len(arrays), adjacencies)
-        if config.require_connected_assembly and not connected:
-            continue
-        adjacencies, pattern_mismatch, pattern_evidence = _score_edge_patterns(
-            adjacencies, validated_profiles
-        )
-        if (
-            pattern_evidence >= config.min_pattern_evidence
-            and pattern_mismatch > config.max_pattern_mismatch
-        ):
-            continue
-        (
-            rounded_corner_mismatch,
-            rounded_corner_evidence,
-            corner_mark_mismatch,
-            corner_mark_evidence,
-            card_feature_details,
-        ) = _score_card_features(
-            poses, width, height, validated_features, config=config
-        )
-        if _violates_trusted_corner_constraint(card_feature_details, config):
-            continue
-        ranked_score = (
-            score
-            + max(0.0, config.placement_gap_mm - achieved_gap_mm)
-            / max(config.placement_gap_mm, 1e-6)
-            + config.pattern_score_weight * pattern_mismatch * pattern_evidence
-            + config.rounded_corner_score_weight
-            * rounded_corner_mismatch
-            * rounded_corner_evidence
-            + config.corner_mark_score_weight
-            * corner_mark_mismatch
-            * corner_mark_evidence
-            + config.card_symmetry_score_weight
-            * card_symmetry_mismatch
-            * card_symmetry_evidence
-        )
-        evaluated_solutions.append(
-            (
-                ranked_score,
-                score,
-                width,
-                height,
-                poses,
-                metrics,
-                placed_polygons,
-                placement_offsets,
-                adjacencies,
-                applied_gap_mm,
-                final_overlap_area_mm2,
-                achieved_gap_mm,
-                gap_satisfied,
-                connected,
-                pattern_mismatch,
-                pattern_evidence,
-                rounded_corner_mismatch,
-                rounded_corner_evidence,
-                corner_mark_mismatch,
-                corner_mark_evidence,
-                card_feature_details,
-                card_symmetry_mismatch,
-                card_symmetry_evidence,
-                symmetry_details,
-            )
-        )
-
-    if not evaluated_solutions:
         raise RuntimeError(
-            "Geometric candidates were found, but none satisfied connectivity, "
-            "non-overlap, adjacent-vertex, and visible-pattern constraints"
+            "No valid assembly found after strict, relaxed, and best-effort searches"
         )
 
     (
@@ -1526,7 +1709,11 @@ def solve_puzzle(
         card_symmetry_mismatch,
         card_symmetry_evidence,
         symmetry_details,
+        fallback_reasons,
+        search_phase_used,
     ) = min(evaluated_solutions, key=lambda item: item[0])
+    relaxed_search_used = search_phase_used == "relaxed"
+    best_effort_search_used = search_phase_used == "best_effort"
     output_pieces = []
     for piece_id, pose, placed_polygon, placement_offset in zip(
         ids, poses, placed_polygons, placement_offsets
@@ -1584,6 +1771,16 @@ def solve_puzzle(
             "solve_elapsed_seconds": time.monotonic() - solve_started,
             "search_timed_out": search_timed_out,
             "relaxed_search_used": relaxed_search_used,
+            "search_phase": search_phase_used,
+            "best_effort_fallback_used": bool(
+                search_timed_out or best_effort_search_used or fallback_reasons
+            ),
+            "best_effort_reasons": [
+                *(["search_timeout"] if search_timed_out else []),
+                *(["geometry_tolerance"] if best_effort_search_used else []),
+                *fallback_reasons,
+            ],
+            "best_effort_candidates_evaluated": best_effort_evaluation_count,
             "appearance_search_enabled": appearance_search_enabled,
             "appearance_ink_point_count": appearance_ink_point_count,
         },

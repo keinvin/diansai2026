@@ -6,6 +6,7 @@ from unittest.mock import patch
 import numpy as np
 
 from puzzle_solver.solver import (
+    PoseCandidate,
     SolverConfig,
     _apply_safe_placement_gap,
     _polygon_edge_distance,
@@ -27,6 +28,54 @@ PIECES = [
 
 
 class SolverTest(unittest.TestCase):
+    @staticmethod
+    def _evaluated_candidate(
+        search_phase: str,
+        fallback_reasons: list[str] | None = None,
+    ) -> tuple:
+        polygon = np.asarray(
+            [[0.0, 0.0], [100.0, 0.0], [100.0, 60.0], [0.0, 60.0]],
+            dtype=float,
+        )
+        pose = PoseCandidate(
+            piece_index=0,
+            rotation_rad=0.0,
+            translation=(0.0, 0.0),
+            polygon=polygon,
+            mask=0,
+            cell_count=6000,
+            boundary_side="top",
+            source_edge=0,
+        )
+        return (
+            0.1,
+            0.1,
+            100.0,
+            60.0,
+            [pose],
+            {"hole_ratio": 0.0, "overlap_ratio": 0.0},
+            [polygon],
+            [np.zeros(2)],
+            [],
+            1.5,
+            0.0,
+            math.inf,
+            True,
+            True,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            {},
+            0.0,
+            0.0,
+            {},
+            list(fallback_reasons or []),
+            search_phase,
+        )
+
     def test_vectorized_polygon_edge_distance(self):
         square = np.asarray([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=float)
         separated = square + [5.0, 0.0]
@@ -178,6 +227,112 @@ class SolverTest(unittest.TestCase):
         self.assertAlmostEqual(result["rectangle"]["height_mm"], 60.0, delta=1.0)
         self.assertLess(result["metrics"]["hole_ratio"], 0.01)
         self.assertLess(result["metrics"]["overlap_ratio"], 0.003)
+
+    def test_best_scored_candidate_is_returned_when_soft_constraint_rejects_all(self):
+        rectangle = [[0.0, 0.0], [100.0, 0.0], [100.0, 60.0], [0.0, 60.0]]
+        edge_profiles = [[np.zeros((32, 3), dtype=float) for _ in range(4)]]
+        piece_features = [
+            {
+                "corner_roundness_mm": [0.0] * 4,
+                "corner_ink_density": [0.0] * 4,
+                "corner_red_density": [0.0] * 4,
+                "corner_black_density": [0.0] * 4,
+                "ink_points_mm": [[1.0, 1.0]] * 300,
+                "ink_point_colours": [0] * 300,
+            }
+        ]
+
+        with patch(
+            "puzzle_solver.solver._score_card_symmetry",
+            return_value=(0.9, 1.0, {}),
+        ):
+            result = solve_puzzle(
+                [rectangle],
+                config=SolverConfig(
+                    width_range=(100.0, 100.0),
+                    height_range=(60.0, 60.0),
+                    max_card_symmetry_mismatch=0.6,
+                    enable_relaxed_retry=False,
+                ),
+                edge_profiles=edge_profiles,
+                piece_features=piece_features,
+            )
+
+        self.assertTrue(result["metrics"]["best_effort_fallback_used"])
+        self.assertEqual(
+            result["metrics"]["best_effort_reasons"],
+            ["card_symmetry_mismatch"],
+        )
+        self.assertEqual(result["metrics"]["search_phase"], "strict")
+
+    def test_rejected_phase_continues_to_the_next_search_phase(self):
+        polygon = [[0.0, 0.0], [100.0, 0.0], [100.0, 60.0], [0.0, 60.0]]
+        pose = self._evaluated_candidate("strict")[4][0]
+        raw_solution = [(0.1, [pose], {"hole_ratio": 0.0, "overlap_ratio": 0.0})]
+        relaxed_candidate = self._evaluated_candidate("relaxed")
+
+        with (
+            patch(
+                "puzzle_solver.solver.candidate_rectangles",
+                return_value=[(100.0, 60.0, 0.0)],
+            ),
+            patch(
+                "puzzle_solver.solver._search_rectangle",
+                return_value=(raw_solution, 1, False),
+            ),
+            patch(
+                "puzzle_solver.solver._evaluate_solution_candidates",
+                side_effect=[([], [], 0, False), ([relaxed_candidate], [], 0, False)],
+            ) as evaluate,
+        ):
+            result = solve_puzzle(
+                [polygon],
+                config=SolverConfig(
+                    width_range=(100.0, 100.0),
+                    height_range=(60.0, 60.0),
+                    relaxed_search_first=False,
+                ),
+            )
+
+        self.assertEqual(evaluate.call_count, 2)
+        self.assertEqual(result["metrics"]["search_phase"], "relaxed")
+
+    def test_timeout_returns_the_best_safe_fallback_candidate(self):
+        polygon = [[0.0, 0.0], [100.0, 0.0], [100.0, 60.0], [0.0, 60.0]]
+        pose = self._evaluated_candidate("strict")[4][0]
+        raw_solution = [(0.1, [pose], {"hole_ratio": 0.0, "overlap_ratio": 0.0})]
+        fallback = self._evaluated_candidate("strict", ["pattern_mismatch"])
+
+        with (
+            patch(
+                "puzzle_solver.solver.candidate_rectangles",
+                return_value=[(100.0, 60.0, 0.0)],
+            ),
+            patch(
+                "puzzle_solver.solver._search_rectangle",
+                return_value=(raw_solution, 1, False),
+            ),
+            patch(
+                "puzzle_solver.solver._evaluate_solution_candidates",
+                return_value=([], [fallback], 1, True),
+            ) as evaluate,
+        ):
+            result = solve_puzzle(
+                [polygon],
+                config=SolverConfig(
+                    width_range=(100.0, 100.0),
+                    height_range=(60.0, 60.0),
+                    relaxed_search_first=False,
+                ),
+            )
+
+        evaluate.assert_called_once()
+        self.assertTrue(result["metrics"]["search_timed_out"])
+        self.assertTrue(result["metrics"]["best_effort_fallback_used"])
+        self.assertEqual(
+            result["metrics"]["best_effort_reasons"],
+            ["search_timeout", "pattern_mismatch"],
+        )
 
     def test_reversed_edge_pattern_profiles_match(self):
         profile = np.column_stack(

@@ -45,6 +45,7 @@ class PipelineSolverModeTest(unittest.TestCase):
         self.assertIsNone(solve_args["edge_profiles"])
         self.assertIsNone(solve_args["piece_features"])
         self.assertFalse(solve_args["config"].relaxed_search_first)
+        self.assertTrue(solve_args["config"].enable_best_effort_fallback)
         self.assertTrue(self.pipeline.solver_config.relaxed_search_first)
 
     def test_card_puzzle_keeps_appearance_search_configuration(self):
@@ -55,6 +56,7 @@ class PipelineSolverModeTest(unittest.TestCase):
         self.assertEqual(solve_args["edge_profiles"], ["edges"])
         self.assertEqual(solve_args["piece_features"], ["features"])
         self.assertIs(solve_args["config"], self.pipeline.solver_config)
+        self.assertTrue(solve_args["config"].enable_best_effort_fallback)
 
 
 if __name__ == "__main__":
