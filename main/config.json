@@ -164,5 +164,6 @@
     2,
     3
   ],
-  "show_solution_piece_images": true
+  "show_solution_piece_images": true,
+  "show_rejected_contours": false
 }

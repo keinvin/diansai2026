@@ -153,6 +153,38 @@ class VisionTest(unittest.TestCase):
         cleaned = _remove_nearly_straight_vertices(polygon, 170.0, 20.0)
         self.assertEqual(len(cleaned), 5)
 
+    def test_rejected_contours_can_be_hidden_from_overlay(self):
+        from puzzle_solver.vision import (
+            Calibration,
+            DetectionResult,
+            RejectedContour,
+            draw_detection_overlay,
+        )
+
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+        calibration = Calibration(np.eye(3), roi_polygon_px=None)
+        result = DetectionResult(
+            pieces=[],
+            mask=np.zeros(image.shape[:2], dtype=np.uint8),
+            roi_mask=np.ones(image.shape[:2], dtype=np.uint8),
+            rejected_contours=[
+                RejectedContour(
+                    np.asarray([[5.0, 5.0], [25.0, 5.0], [15.0, 25.0]]),
+                    "测试拒绝轮廓",
+                )
+            ],
+        )
+
+        hidden = draw_detection_overlay(
+            image, result, calibration, show_rejected_contours=False
+        )
+        shown = draw_detection_overlay(
+            image, result, calibration, show_rejected_contours=True
+        )
+
+        self.assertTrue(np.array_equal(hidden, image))
+        self.assertFalse(np.array_equal(shown, image))
+
     def test_synthetic_detection_and_solve(self):
         import cv2
 

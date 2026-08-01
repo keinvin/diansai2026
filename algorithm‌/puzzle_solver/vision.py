@@ -994,7 +994,11 @@ def detect_pieces(
 
 
 def draw_detection_overlay(
-    image_bgr: np.ndarray, result: DetectionResult, calibration: Calibration
+    image_bgr: np.ndarray,
+    result: DetectionResult,
+    calibration: Calibration,
+    *,
+    show_rejected_contours: bool = True,
 ) -> np.ndarray:
     overlay = image_bgr.copy()
     if calibration.roi_polygon_px is not None:
@@ -1034,23 +1038,24 @@ def draw_detection_overlay(
             2,
             cv2.LINE_AA,
         )
-    for rejected in result.rejected_contours:
-        contour = np.round(rejected.contour_px).astype(np.int32)
-        if len(contour) < 3:
-            continue
-        colour = (40, 40, 235)
-        cv2.polylines(overlay, [contour], True, colour, 2, cv2.LINE_AA)
-        anchor = tuple(contour[np.argmin(contour[:, 1])])
-        cv2.putText(
-            overlay,
-            rejected.reason,
-            (int(anchor[0]), max(20, int(anchor[1]) - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            colour,
-            2,
-            cv2.LINE_AA,
-        )
+    if show_rejected_contours:
+        for rejected in result.rejected_contours:
+            contour = np.round(rejected.contour_px).astype(np.int32)
+            if len(contour) < 3:
+                continue
+            colour = (40, 40, 235)
+            cv2.polylines(overlay, [contour], True, colour, 2, cv2.LINE_AA)
+            anchor = tuple(contour[np.argmin(contour[:, 1])])
+            cv2.putText(
+                overlay,
+                rejected.reason,
+                (int(anchor[0]), max(20, int(anchor[1]) - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                colour,
+                2,
+                cv2.LINE_AA,
+            )
     return overlay
 
 

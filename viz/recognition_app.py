@@ -176,6 +176,7 @@ class RecognitionWorker(QObject):
         transport_only: bool,
         use_piece_features: bool,
         show_piece_images: bool,
+        show_rejected_contours: bool,
     ) -> None:
         super().__init__()
         self._frame = frame
@@ -184,6 +185,7 @@ class RecognitionWorker(QObject):
         self._transport_only = transport_only
         self._use_piece_features = use_piece_features
         self._show_piece_images = show_piece_images
+        self._show_rejected_contours = show_rejected_contours
 
     @Slot()
     def run(self) -> None:
@@ -198,7 +200,10 @@ class RecognitionWorker(QObject):
             self.failed.emit(str(exc))
             return
         overlay = draw_detection_overlay(
-            run.corrected_frame, run.result, run.calibration
+            run.corrected_frame,
+            run.result,
+            run.calibration,
+            show_rejected_contours=self._show_rejected_contours,
         )
         if run.solution is not None:
             overlay = draw_solution_overlay(
@@ -215,6 +220,8 @@ class RecognitionWorker(QObject):
                 "solution": run.solution,
                 "solve_error": run.solve_error,
                 "overlay": overlay,
+                "corrected_frame": run.corrected_frame,
+                "calibration": run.calibration,
                 "puzzle_search_enabled": run.puzzle_search_enabled,
                 "transport_only": run.transport_only,
                 "timings": run.timings,
@@ -361,6 +368,7 @@ class RecognitionWindow(QMainWindow):
             )
         self._latest_frame: np.ndarray | None = None
         self._latest_solution: dict | None = None
+        self._last_recognition_payload: dict | None = None
         self._frozen = False
         self._recognition_thread: QThread | None = None
         self._recognition_worker: RecognitionWorker | None = None
@@ -504,15 +512,6 @@ class RecognitionWindow(QMainWindow):
         self._region_selector.currentIndexChanged.connect(self._set_a4_region)
         side_layout.addWidget(self._region_selector)
 
-        self._show_piece_images_checkbox = QCheckBox("拼接区显示原始图案")
-        self._show_piece_images_checkbox.setChecked(
-            bool(self._document.get("show_solution_piece_images", False))
-        )
-        self._show_piece_images_checkbox.toggled.connect(
-            self._set_show_piece_images
-        )
-        side_layout.addWidget(self._show_piece_images_checkbox)
-
         self._puzzle_search_checkbox = QCheckBox("启用拼图搜索")
         self._puzzle_search_checkbox.setChecked(
             bool(self._document.get("puzzle_search_enabled", True))
@@ -563,6 +562,24 @@ class RecognitionWindow(QMainWindow):
         )
         side_layout.addWidget(self._servo_calibration_button)
 
+        self._show_piece_images_checkbox = QCheckBox("拼接区显示原始图案")
+        self._show_piece_images_checkbox.setChecked(
+            bool(self._document.get("show_solution_piece_images", False))
+        )
+        self._show_piece_images_checkbox.toggled.connect(
+            self._set_show_piece_images
+        )
+        side_layout.addWidget(self._show_piece_images_checkbox)
+
+        self._show_rejected_contours_checkbox = QCheckBox("显示识别失败轮廓")
+        self._show_rejected_contours_checkbox.setChecked(
+            bool(self._document.get("show_rejected_contours", False))
+        )
+        self._show_rejected_contours_checkbox.toggled.connect(
+            self._set_show_rejected_contours
+        )
+        side_layout.addWidget(self._show_rejected_contours_checkbox)
+
         self._details = QLabel()
         self._details.setWordWrap(True)
         self._details.setObjectName("details")
@@ -577,7 +594,6 @@ class RecognitionWindow(QMainWindow):
             self._recognize_button,
             self._execute_button,
             self._region_selector,
-            self._show_piece_images_checkbox,
             self._retake_button,
         ]
         self._configuration_controls = [
@@ -589,6 +605,8 @@ class RecognitionWindow(QMainWindow):
             self._clear_button,
             self._grbl_calibration_button,
             self._servo_calibration_button,
+            self._show_piece_images_checkbox,
+            self._show_rejected_contours_checkbox,
         ]
         # Only one control group is used at a time. Hiding the configuration
         # group initially keeps the inactive workspace from forcing the task
@@ -629,6 +647,7 @@ class RecognitionWindow(QMainWindow):
             return
         self._frozen = False
         self._latest_solution = None
+        self._last_recognition_payload = None
         self._one_click_execute_pending = False
         self._pages.setCurrentIndex(0)
 
@@ -726,12 +745,42 @@ class RecognitionWindow(QMainWindow):
             return
         self._document["show_solution_piece_images"] = bool(enabled)
         self._save_document_fields("show_solution_piece_images")
+        self._render_last_recognition_overlay()
+
+    def _set_show_rejected_contours(self, enabled: bool) -> None:
+        if self._recognition_thread is not None or self._motion_thread is not None:
+            return
+        self._document["show_rejected_contours"] = bool(enabled)
+        self._save_document_fields("show_rejected_contours")
+        self._render_last_recognition_overlay()
+
+    def _render_last_recognition_overlay(self) -> None:
+        payload = self._last_recognition_payload
+        if payload is None:
+            return
+        overlay = draw_detection_overlay(
+            payload["corrected_frame"],
+            payload["result"],
+            payload["calibration"],
+            show_rejected_contours=self._show_rejected_contours_checkbox.isChecked(),
+        )
+        if payload["solution"] is not None:
+            overlay = draw_solution_overlay(
+                overlay,
+                payload["solution"],
+                payload["calibration"],
+                source_image=payload["corrected_frame"],
+                source_pieces=payload["result"].pieces,
+                show_piece_images=self._show_piece_images_checkbox.isChecked(),
+            )
+        self._view.set_image(overlay, [])
 
     def _clear_calibration(self) -> None:
         if self._recognition_thread is not None:
             return
         self._corners = []
         self._latest_solution = None
+        self._last_recognition_payload = None
         self._execute_button.setEnabled(False)
         self._document["a4_corners_px"] = []
         self._document["a4_corner_indices"] = []
@@ -894,6 +943,7 @@ class RecognitionWindow(QMainWindow):
         puzzle_search_enabled = not transport_only
         use_piece_features = self._task_mode == "card_puzzle"
         show_piece_images = self._show_piece_images_checkbox.isChecked()
+        show_rejected_contours = self._show_rejected_contours_checkbox.isChecked()
         if transport_only:
             self._status.setText("正在识别碎片并生成搬运位置……")
         else:
@@ -906,6 +956,7 @@ class RecognitionWindow(QMainWindow):
             transport_only,
             use_piece_features,
             show_piece_images,
+            show_rejected_contours,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -970,8 +1021,9 @@ class RecognitionWindow(QMainWindow):
         self._latest_timings = dict(payload["timings"])
         self._frozen = True
         self._latest_solution = solution
+        self._last_recognition_payload = payload
         self._execute_button.setEnabled(solution is not None)
-        self._view.set_image(payload["overlay"], [])
+        self._render_last_recognition_overlay()
         if transport_only and solution is None:
             self._status.setText(f"识别到 {len(result.pieces)} 块碎片，但无法生成搬运位置")
         elif transport_only:
@@ -1047,6 +1099,7 @@ class RecognitionWindow(QMainWindow):
         self._details.clear()
         self._frozen = False
         self._one_click_execute_pending = False
+        self._last_recognition_payload = None
         self._stop_one_click_elapsed("结束用时")
 
     @Slot()
@@ -1150,6 +1203,7 @@ class RecognitionWindow(QMainWindow):
             + "\n".join(timing_lines)
         )
         self._latest_solution = None
+        self._last_recognition_payload = None
         self._stop_one_click_elapsed("完成用时")
         self._play_finished_sound()
 
