@@ -9,6 +9,31 @@ CV2_AVAILABLE = importlib.util.find_spec("cv2") is not None
 
 @unittest.skipUnless(CV2_AVAILABLE, "OpenCV is not installed")
 class VisionTest(unittest.TestCase):
+    def test_multiscale_fit_preserves_concave_piece_area(self):
+        import cv2
+
+        from puzzle_solver.vision import VisionConfig, _fit_piece_polygon
+
+        corners = np.asarray([[0, 0], [70, 0], [70, 45], [36, 24], [0, 45]], dtype=float)
+        contour = []
+        for start, end in zip(corners, np.roll(corners, -1, axis=0)):
+            contour.extend(start + (end - start) * fraction for fraction in np.linspace(0, 1, 30, endpoint=False))
+        contour = np.asarray(contour)
+        contour[:, 1] += 0.18 * np.sin(np.arange(len(contour)) * 1.7)
+        fitted, _ = _fit_piece_polygon(
+            contour,
+            VisionConfig(
+                approx_epsilon_mm=0.2,
+                max_approx_epsilon_mm=3.0,
+                max_vertices=5,
+            ),
+        )
+        source_area = abs(cv2.contourArea(contour.astype(np.float32)))
+        fitted_area = abs(cv2.contourArea(fitted.astype(np.float32)))
+        self.assertLessEqual(len(fitted), 5)
+        self.assertGreaterEqual(len(fitted), 3)
+        self.assertLess(abs(fitted_area - source_area) / source_area, 0.03)
+
     def test_rounded_card_corner_pair_becomes_one_corner(self):
         from puzzle_solver.vision import _merge_rounded_corner_vertices
 
@@ -60,6 +85,37 @@ class VisionTest(unittest.TestCase):
         )
         self.assertEqual(len(result.pieces), 1)
         self.assertEqual(len(result.pieces[0].polygon_mm), 4)
+
+    def test_corner_touching_pieces_are_split(self):
+        import cv2
+
+        from puzzle_solver.vision import Calibration, VisionConfig, detect_pieces
+
+        pixels_per_mm = 5
+        image = np.full((750, 650, 3), (35, 35, 35), dtype=np.uint8)
+        first = np.asarray([[30, 20], [80, 20], [80, 70], [30, 70]]) * pixels_per_mm
+        second = np.asarray([[80, 70], [110, 100], [80, 130], [50, 100]]) * pixels_per_mm
+        cv2.fillPoly(image, [first.astype(np.int32)], (245, 245, 245))
+        cv2.fillPoly(image, [second.astype(np.int32)], (245, 245, 245))
+        calibration = Calibration.from_dict(
+            {
+                "mm_per_pixel": 1.0 / pixels_per_mm,
+                "roi_polygon_px": [[0, 0], [649, 0], [649, 749], [0, 749]],
+                "use_camera_intrinsics": False,
+            },
+            image.shape,
+        )
+        result = detect_pieces(
+            image,
+            calibration,
+            VisionConfig(
+                morphology_kernel_px=3,
+                min_piece_area_mm2=100.0,
+                collinear_vertex_tolerance_mm=0.5,
+            ),
+        )
+        self.assertEqual(len(result.pieces), 2)
+        self.assertTrue(all(3 <= len(piece.polygon_mm) <= 5 for piece in result.pieces))
 
     def test_nearly_straight_false_vertex_is_removed(self):
         from puzzle_solver.vision import _remove_nearly_straight_vertices

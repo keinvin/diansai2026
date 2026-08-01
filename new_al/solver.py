@@ -11,23 +11,11 @@ from typing import Iterable, Sequence
 import cv2
 import numpy as np
 
-try:
-    from ._native_search import (
-        NativeSearchError,
-        NativeSearchUnavailable,
-        search_candidate_masks,
-    )
-except ImportError:
-    # The optional C++ extension is not bundled on every deployment target.
-    # Keep the algorithm usable through the Python DFS implementation below.
-    class NativeSearchError(RuntimeError):
-        pass
-
-    class NativeSearchUnavailable(RuntimeError):
-        pass
-
-    def search_candidate_masks(*_args, **_kwargs):
-        raise NativeSearchUnavailable("C++ puzzle search extension is unavailable")
+from ._native_search import (
+    NativeSearchError,
+    NativeSearchUnavailable,
+    search_candidate_masks,
+)
 
 
 ArrayLike = Sequence[Sequence[float]]

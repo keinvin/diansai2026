@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Callable, Sequence
 
-import cv2
 import numpy as np
 
 from .config import load_config, project_path
@@ -14,7 +13,14 @@ from .timing import StageTimings, append_timing_log
 
 from puzzle_solver.coordinates import A4ToGrblTransform
 from puzzle_solver.solver import SolverConfig, solve_puzzle
-from puzzle_solver.vision import Calibration, DetectionResult, VisionConfig, detect_pieces
+from puzzle_solver.vision import (
+    Calibration,
+    DetectionResult,
+    VisionConfig,
+    detect_pieces,
+    extract_edge_profiles,
+    extract_piece_features,
+)
 from motion.motion_exec import MotionExecutor, PickPlaceConfig, build_pick_place_plan
 
 
@@ -43,7 +49,8 @@ def solver_config_from_dict(document: dict) -> SolverConfig:
     for key in ("width_range", "height_range"):
         if key in values:
             values[key] = tuple(values[key])
-    return SolverConfig(**values)
+    valid_fields = {field.name for field in fields(SolverConfig)}
+    return SolverConfig(**{key: value for key, value in values.items() if key in valid_fields})
 
 
 def place_solution_in_opposite_half(
@@ -76,49 +83,6 @@ def place_solution_in_opposite_half(
             np.asarray(piece["target_polygon_mm"], dtype=float) + origin
         ).tolist()
     return solution
-
-
-def extract_edge_profiles(
-    corrected_frame_bgr: np.ndarray,
-    pieces,
-    sample_count: int = 48,
-) -> list[list[np.ndarray]]:
-    """Sample a narrow LAB strip just inside every detected piece edge."""
-
-    lab = cv2.cvtColor(corrected_frame_bgr, cv2.COLOR_BGR2LAB)
-    edge_profiles: list[list[np.ndarray]] = []
-    positions = np.linspace(0.08, 0.92, sample_count, dtype=np.float32)
-    inset_pixels = (4.0, 7.0, 10.0)
-    for piece in pieces:
-        polygon = np.asarray(piece.polygon_px, dtype=np.float32)
-        centroid = polygon.mean(axis=0)
-        piece_profiles: list[np.ndarray] = []
-        for edge_index in range(len(polygon)):
-            start = polygon[edge_index]
-            end = polygon[(edge_index + 1) % len(polygon)]
-            edge = end - start
-            length = float(np.linalg.norm(edge))
-            if length <= 1e-6:
-                piece_profiles.append(np.zeros((sample_count, 3), dtype=float))
-                continue
-            normal = np.array([-edge[1], edge[0]], dtype=np.float32) / length
-            midpoint = (start + end) * 0.5
-            if float(np.dot(normal, centroid - midpoint)) < 0.0:
-                normal *= -1.0
-            base = start[None, :] + positions[:, None] * edge[None, :]
-            maps = [base + normal[None, :] * inset for inset in inset_pixels]
-            map_x = np.stack([points[:, 0] for points in maps]).astype(np.float32)
-            map_y = np.stack([points[:, 1] for points in maps]).astype(np.float32)
-            sampled = cv2.remap(
-                lab,
-                map_x,
-                map_y,
-                interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REPLICATE,
-            )
-            piece_profiles.append(sampled.astype(float).mean(axis=0))
-        edge_profiles.append(piece_profiles)
-    return edge_profiles
 
 
 class MainPipeline:
@@ -188,12 +152,16 @@ class MainPipeline:
             with timings.measure("solve"):
                 try:
                     edge_profiles = extract_edge_profiles(corrected_frame, result.pieces)
+                    piece_features = extract_piece_features(
+                        corrected_frame, result.pieces, calibration
+                    )
                     solution = solve_puzzle(
                         [piece.polygon_mm for piece in result.pieces],
                         [piece.id for piece in result.pieces],
                         target_origin_mm=(0.0, 0.0),
                         config=self.solver_config,
                         edge_profiles=edge_profiles,
+                        piece_features=piece_features,
                     )
                     solution = place_solution_in_opposite_half(
                         solution,

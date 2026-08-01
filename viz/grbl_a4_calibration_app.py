@@ -354,7 +354,7 @@ class CalibrationWindow(QMainWindow):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="A4 ↔ GRBL 坐标校准页面")
-    parser.add_argument("--port", default="/dev/ttyUSB0")
+    parser.add_argument("--port", default="/dev/ttyUSB1")
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument(
         "--feed",

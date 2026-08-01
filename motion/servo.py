@@ -17,7 +17,7 @@ import fashionstar_uart_sdk as uservo_sdk
 import serial
 
 
-DEFAULT_PORT = "/dev/ttyUSB1"
+DEFAULT_PORT = "/dev/ttyUSB0"
 DEFAULT_BAUDRATE = 115200
 
 
@@ -46,7 +46,7 @@ class FashionStarServo:
     """High-level wrapper around ``fashionstar_uart_sdk.UartServoManager``.
 
     The default configuration matches the confirmed local setup: ID 0 at
-    115200 baud on ``/dev/ttyUSB1``.
+    115200 baud on ``/dev/ttyUSB0``.
     """
 
     def __init__(

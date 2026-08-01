@@ -1,0 +1,691 @@
+diff --git a/algorithm‌/puzzle_solver/solver.py b/algorithm‌/puzzle_solver/solver.py
+index c77e149..120a7af 100644
+--- a/algorithm‌/puzzle_solver/solver.py
++++ b/algorithm‌/puzzle_solver/solver.py
+@@ -4,7 +4,7 @@ import argparse
+ import json
+ import math
+ import time
+-from dataclasses import asdict, dataclass
++from dataclasses import asdict, dataclass, replace
+ from pathlib import Path
+ from typing import Iterable, Sequence
+ 
+@@ -25,11 +25,14 @@ class SolverConfig:
+     dimension_area_tolerance: float = 0.04
+     inside_tolerance_mm: float = 0.75
+     max_rectangle_candidates: int = 40
++    preferred_aspect_ratio: float = 5.0 / 3.0
++    aspect_ratio_score_weight: float = 0.02
+     max_hole_ratio: float = 0.025
+     max_overlap_ratio: float = 0.002
+     max_search_nodes_per_rectangle: int = 300_000
+     max_solutions_per_rectangle: int = 8
+     max_solve_seconds: float = 0.0
++    early_accept_score: float = 0.06
+     placement_gap_mm: float = 1.5
+     max_placement_gap_mm: float = 8.0
+     adjacency_detection_tolerance_mm: float = 8.0
+@@ -39,6 +42,12 @@ class SolverConfig:
+     min_pattern_evidence: float = 0.12
+     max_pattern_mismatch: float = 0.45
+     require_connected_assembly: bool = True
++    enable_relaxed_retry: bool = True
++    retry_dimension_area_tolerance: float = 0.06
++    retry_inside_tolerance_mm: float = 4.0
++    retry_max_hole_ratio: float = 0.06
++    retry_max_overlap_ratio: float = 0.02
++    retry_early_accept_score: float = 0.12
+ 
+ 
+ @dataclass
+@@ -137,7 +146,16 @@ def candidate_rectangles(
+                     if error <= config.dimension_area_tolerance:
+                         candidates.append((width, height, error))
+ 
+-    candidates.sort(key=lambda item: (item[2], item[0] * 2.0 + item[1]))
++    def candidate_priority(item: tuple[float, float, float]) -> tuple[float, float, float]:
++        width, height, area_error = item
++        aspect_penalty = 0.0
++        if config.preferred_aspect_ratio > 0.0 and config.aspect_ratio_score_weight > 0.0:
++            aspect_penalty = config.aspect_ratio_score_weight * abs(
++                math.log((width / height) / config.preferred_aspect_ratio)
++            )
++        return area_error + aspect_penalty, area_error, width * 2.0 + height
++
++    candidates.sort(key=candidate_priority)
+     unique: list[tuple[float, float, float]] = []
+     seen: set[tuple[int, int]] = set()
+     for candidate in candidates:
+@@ -294,33 +312,40 @@ def _search_rectangle(
+     config: SolverConfig,
+     deadline: float | None = None,
+ ) -> tuple[list[tuple[float, list[PoseCandidate], dict]], int, bool]:
+-    candidates = [
+-        generate_piece_poses(index, polygon, width, height, config)
+-        for index, polygon in enumerate(polygons)
+-    ]
+-    if any(not piece_candidates for piece_candidates in candidates):
+-        return [], 0, False
+-
+-    order = sorted(range(len(polygons)), key=lambda index: len(candidates[index]))
++    def estimated_pose_count(polygon: np.ndarray) -> int:
++        estimate = 0
++        for edge_index in range(len(polygon)):
++            length = float(
++                np.linalg.norm(polygon[(edge_index + 1) % len(polygon)] - polygon[edge_index])
++            )
++            for side_length in (width, width, height, height):
++                if length <= side_length + config.inside_tolerance_mm:
++                    estimate += 2 * (
++                        int(max(0.0, side_length - length) / config.grid_mm) + 1
++                    )
++        return estimate
++
++    candidates: list[list[PoseCandidate]] = [[] for _ in polygons]
++    generation_order = sorted(
++        range(len(polygons)), key=lambda index: estimated_pose_count(polygons[index])
++    )
++    for index in generation_order:
++        candidates[index] = generate_piece_poses(index, polygons[index], width, height, config)
++        if not candidates[index]:
++            return [], 0, False
++
+     rectangle_cells = int(round(width / config.grid_mm)) * int(
+         round(height / config.grid_mm)
+     )
+     allowed_holes = math.ceil(rectangle_cells * config.max_hole_ratio)
+     allowed_overlap = math.ceil(rectangle_cells * config.max_overlap_ratio)
+ 
+-    remaining_possible = [0] * (len(order) + 1)
+-    for depth in range(len(order) - 1, -1, -1):
+-        union = 0
+-        for pose in candidates[order[depth]]:
+-            union |= pose.mask
+-        remaining_possible[depth] = remaining_possible[depth + 1] | union
+-
+     chosen: list[PoseCandidate | None] = [None] * len(polygons)
+     solutions: list[tuple[float, list[PoseCandidate], dict]] = []
+     nodes = 0
+     timed_out = False
+ 
+-    def dfs(depth: int, occupied: int, overlap_cells: int) -> None:
++    def dfs(remaining: tuple[int, ...], occupied: int, overlap_cells: int) -> None:
+         nonlocal nodes, timed_out
+         if nodes >= config.max_search_nodes_per_rectangle:
+             return
+@@ -329,11 +354,7 @@ def _search_rectangle(
+             return
+         nodes += 1
+ 
+-        impossible_holes = rectangle_cells - (occupied | remaining_possible[depth]).bit_count()
+-        if impossible_holes > allowed_holes:
+-            return
+-
+-        if depth == len(order):
++        if not remaining:
+             hole_cells = rectangle_cells - occupied.bit_count()
+             if hole_cells > allowed_holes or overlap_cells > allowed_overlap:
+                 return
+@@ -352,19 +373,46 @@ def _search_rectangle(
+             del solutions[config.max_solutions_per_rectangle :]
+             return
+ 
+-        piece_index = order[depth]
+-        for pose in candidates[piece_index]:
++        viable_by_piece: dict[int, list[tuple[PoseCandidate, int]]] = {}
++        possible_coverage = occupied
++        maximum_new_cells = 0
++        for piece_index in remaining:
++            viable: list[tuple[PoseCandidate, int]] = []
++            piece_union = 0
++            piece_maximum = 0
++            for pose in candidates[piece_index]:
++                overlap = (occupied & pose.mask).bit_count()
++                if overlap_cells + overlap > allowed_overlap:
++                    continue
++                viable.append((pose, overlap))
++                piece_union |= pose.mask
++                piece_maximum = max(piece_maximum, pose.cell_count - overlap)
++            if not viable:
++                return
++            viable_by_piece[piece_index] = viable
++            possible_coverage |= piece_union
++            maximum_new_cells += piece_maximum
++
++        if rectangle_cells - possible_coverage.bit_count() > allowed_holes:
++            return
++        if rectangle_cells - (occupied.bit_count() + maximum_new_cells) > allowed_holes:
++            return
++
++        piece_index = min(remaining, key=lambda index: len(viable_by_piece[index]))
++        next_remaining = tuple(index for index in remaining if index != piece_index)
++        viable_poses = sorted(
++            viable_by_piece[piece_index],
++            key=lambda item: (item[1], -item[0].cell_count),
++        )
++        for pose, overlap in viable_poses:
+             if timed_out:
+                 return
+-            overlap = (occupied & pose.mask).bit_count()
+             new_overlap = overlap_cells + overlap
+-            if new_overlap > allowed_overlap:
+-                continue
+             chosen[piece_index] = pose
+-            dfs(depth + 1, occupied | pose.mask, new_overlap)
++            dfs(next_remaining, occupied | pose.mask, new_overlap)
+             chosen[piece_index] = None
+ 
+-    dfs(0, 0, 0)
++    dfs(tuple(range(len(polygons))), 0, 0)
+     return solutions, nodes, timed_out
+ 
+ 
+@@ -535,6 +583,57 @@ def _raster_overlap_area_mm2(
+     return overlap_pixels * resolution_mm * resolution_mm
+ 
+ 
++def _resolve_placement_overlaps(
++    polygons: Sequence[np.ndarray],
++    initial_offsets: Sequence[np.ndarray],
++    maximum_offset_mm: float,
++    tolerance_mm2: float,
++) -> tuple[list[np.ndarray], list[np.ndarray], float]:
++    """Repel overlapping pairs while keeping every safety offset bounded."""
++
++    offsets = [np.asarray(offset, dtype=float).copy() for offset in initial_offsets]
++    step_mm = 0.25
++    maximum_iterations = max(1, int(math.ceil(maximum_offset_mm / step_mm)) * 4)
++    for _ in range(maximum_iterations):
++        placed = [polygon + offset for polygon, offset in zip(polygons, offsets)]
++        conflicts: list[tuple[int, int]] = []
++        for first in range(len(placed)):
++            for second in range(first + 1, len(placed)):
++                if (
++                    _raster_overlap_area_mm2([placed[first], placed[second]])
++                    > tolerance_mm2
++                ):
++                    conflicts.append((first, second))
++        if not conflicts:
++            overlap = _raster_overlap_area_mm2(placed)
++            return placed, offsets, overlap
++
++        changed = False
++        for first, second in conflicts:
++            first_centre = polygons[first].mean(axis=0) + offsets[first]
++            second_centre = polygons[second].mean(axis=0) + offsets[second]
++            direction = first_centre - second_centre
++            length = float(np.linalg.norm(direction))
++            if length <= 1e-9:
++                angle = 2.0 * math.pi * first / max(1, len(polygons))
++                direction = np.asarray([math.cos(angle), math.sin(angle)])
++            else:
++                direction /= length
++            for index, sign in ((first, 1.0), (second, -1.0)):
++                proposed = offsets[index] + direction * (sign * step_mm * 0.5)
++                norm = float(np.linalg.norm(proposed))
++                if norm > maximum_offset_mm > 0.0:
++                    proposed *= maximum_offset_mm / norm
++                if not np.allclose(proposed, offsets[index]):
++                    offsets[index] = proposed
++                    changed = True
++        if not changed:
++            break
++
++    placed = [polygon + offset for polygon, offset in zip(polygons, offsets)]
++    return placed, offsets, _raster_overlap_area_mm2(placed)
++
++
+ def _adjacency_vertex_distances(
+     polygons: Sequence[np.ndarray], adjacencies: list[dict]
+ ) -> list[dict]:
+@@ -675,8 +774,12 @@ def _apply_safe_placement_gap(
+ 
+     for gap in gaps:
+         offsets = _placement_offsets(polygons, width, height, float(gap))
+-        placed = [polygon + offset for polygon, offset in zip(polygons, offsets)]
+-        overlap_area = _raster_overlap_area_mm2(placed)
++        placed, offsets, overlap_area = _resolve_placement_overlaps(
++            polygons,
++            offsets,
++            maximum_gap,
++            config.final_overlap_tolerance_mm2,
++        )
+         checked_adjacencies = _adjacency_vertex_distances(placed, adjacencies)
+         vertices_valid = all(
+             adjacency["max_corresponding_vertex_distance_mm"]
+@@ -731,10 +834,6 @@ def solve_puzzle(
+     if origin.shape != (2,):
+         raise ValueError("target_origin_mm must contain exactly two values")
+ 
+-    rectangles = candidate_rectangles(arrays, config)
+-    if not rectangles:
+-        raise RuntimeError("No rectangle dimensions satisfy the configured ranges")
+-
+     all_solutions: list[tuple[float, float, float, list[PoseCandidate], dict]] = []
+     total_nodes = 0
+     solve_started = time.monotonic()
+@@ -744,28 +843,67 @@ def solve_puzzle(
+         else None
+     )
+     search_timed_out = False
+-    for width, height, dimension_error in rectangles:
+-        if deadline is not None and time.monotonic() >= deadline:
+-            search_timed_out = True
+-            break
+-        solutions, nodes, rectangle_timed_out = _search_rectangle(
+-            arrays, width, height, dimension_error, config, deadline
++    rectangle_candidates_found = False
++    relaxed_search_used = False
++    search_configs = [config]
++    if config.enable_relaxed_retry:
++        search_configs.append(
++            replace(
++                config,
++                dimension_area_tolerance=max(
++                    config.dimension_area_tolerance,
++                    config.retry_dimension_area_tolerance,
++                ),
++                inside_tolerance_mm=max(
++                    config.inside_tolerance_mm, config.retry_inside_tolerance_mm
++                ),
++                max_hole_ratio=max(config.max_hole_ratio, config.retry_max_hole_ratio),
++                max_overlap_ratio=max(
++                    config.max_overlap_ratio, config.retry_max_overlap_ratio
++                ),
++                early_accept_score=max(
++                    config.early_accept_score, config.retry_early_accept_score
++                ),
++                enable_relaxed_retry=False,
++            )
+         )
+-        total_nodes += nodes
+-        for score, poses, metrics in solutions:
+-            all_solutions.append((score, width, height, poses, metrics))
+-        if all_solutions and all_solutions[0][0] <= 0.005:
++
++    for phase_index, search_config in enumerate(search_configs):
++        rectangles = candidate_rectangles(arrays, search_config)
++        rectangle_candidates_found |= bool(rectangles)
++        for width, height, dimension_error in rectangles:
++            if deadline is not None and time.monotonic() >= deadline:
++                search_timed_out = True
++                break
++            solutions, nodes, rectangle_timed_out = _search_rectangle(
++                arrays, width, height, dimension_error, search_config, deadline
++            )
++            total_nodes += nodes
++            for score, poses, metrics in solutions:
++                all_solutions.append((score, width, height, poses, metrics))
++            all_solutions.sort(key=lambda item: item[0])
++            if (
++                all_solutions
++                and search_config.early_accept_score > 0.0
++                and all_solutions[0][0] <= search_config.early_accept_score
++            ):
++                break
++            if rectangle_timed_out:
++                search_timed_out = True
++                break
++        if all_solutions:
++            relaxed_search_used = phase_index > 0
+             break
+-        if rectangle_timed_out:
+-            search_timed_out = True
++        if search_timed_out:
+             break
+-        all_solutions.sort(key=lambda item: item[0])
+ 
+     if not all_solutions:
+         if search_timed_out:
+             raise RuntimeError(
+                 f"Puzzle search exceeded its {config.max_solve_seconds:.1f} second time budget"
+             )
++        if not rectangle_candidates_found:
++            raise RuntimeError("No rectangle dimensions satisfy the configured ranges")
+         raise RuntimeError(
+             "No valid assembly found. Check polygon calibration, dimension ranges, "
+             "or increase the hole/area tolerances."
+@@ -889,6 +1027,7 @@ def solve_puzzle(
+             "pattern_evidence": pattern_evidence,
+             "solve_elapsed_seconds": time.monotonic() - solve_started,
+             "search_timed_out": search_timed_out,
++            "relaxed_search_used": relaxed_search_used,
+         },
+         "pieces": output_pieces,
+         "adjacencies": adjacencies,
+diff --git a/algorithm‌/puzzle_solver/tests/test_solver.py b/algorithm‌/puzzle_solver/tests/test_solver.py
+index 22c423b..d42b59e 100644
+--- a/algorithm‌/puzzle_solver/tests/test_solver.py
++++ b/algorithm‌/puzzle_solver/tests/test_solver.py
+@@ -5,6 +5,7 @@ import numpy as np
+ 
+ from puzzle_solver.solver import (
+     SolverConfig,
++    _resolve_placement_overlaps,
+     _score_edge_patterns,
+     polygon_area,
+     solve_puzzle,
+@@ -20,6 +21,21 @@ PIECES = [
+ 
+ 
+ class SolverTest(unittest.TestCase):
++    def test_pairwise_repulsion_removes_residual_overlap(self):
++        polygons = [
++            np.asarray([[0, 0], [50, 0], [50, 30], [0, 30]], dtype=float),
++            np.asarray([[48, 0], [98, 0], [98, 30], [48, 30]], dtype=float),
++        ]
++        placed, offsets, overlap = _resolve_placement_overlaps(
++            polygons,
++            [np.zeros(2), np.zeros(2)],
++            maximum_offset_mm=8.0,
++            tolerance_mm2=0.25,
++        )
++        self.assertLessEqual(overlap, 0.25)
++        self.assertTrue(all(np.linalg.norm(offset) <= 8.0 + 1e-9 for offset in offsets))
++        self.assertEqual(len(placed), 2)
++
+     def test_fixed_four_piece_example(self):
+         result = solve_puzzle(
+             PIECES,
+diff --git a/algorithm‌/puzzle_solver/tests/test_vision.py b/algorithm‌/puzzle_solver/tests/test_vision.py
+index 72ca202..b48c85c 100644
+--- a/algorithm‌/puzzle_solver/tests/test_vision.py
++++ b/algorithm‌/puzzle_solver/tests/test_vision.py
+@@ -9,6 +9,31 @@ CV2_AVAILABLE = importlib.util.find_spec("cv2") is not None
+ 
+ @unittest.skipUnless(CV2_AVAILABLE, "OpenCV is not installed")
+ class VisionTest(unittest.TestCase):
++    def test_multiscale_fit_preserves_concave_piece_area(self):
++        import cv2
++
++        from puzzle_solver.vision import VisionConfig, _fit_piece_polygon
++
++        corners = np.asarray([[0, 0], [70, 0], [70, 45], [36, 24], [0, 45]], dtype=float)
++        contour = []
++        for start, end in zip(corners, np.roll(corners, -1, axis=0)):
++            contour.extend(start + (end - start) * fraction for fraction in np.linspace(0, 1, 30, endpoint=False))
++        contour = np.asarray(contour)
++        contour[:, 1] += 0.18 * np.sin(np.arange(len(contour)) * 1.7)
++        fitted, _ = _fit_piece_polygon(
++            contour,
++            VisionConfig(
++                approx_epsilon_mm=0.2,
++                max_approx_epsilon_mm=3.0,
++                max_vertices=5,
++            ),
++        )
++        source_area = abs(cv2.contourArea(contour.astype(np.float32)))
++        fitted_area = abs(cv2.contourArea(fitted.astype(np.float32)))
++        self.assertLessEqual(len(fitted), 5)
++        self.assertGreaterEqual(len(fitted), 3)
++        self.assertLess(abs(fitted_area - source_area) / source_area, 0.03)
++
+     def test_rounded_card_corner_pair_becomes_one_corner(self):
+         from puzzle_solver.vision import _merge_rounded_corner_vertices
+ 
+@@ -61,6 +86,37 @@ class VisionTest(unittest.TestCase):
+         self.assertEqual(len(result.pieces), 1)
+         self.assertEqual(len(result.pieces[0].polygon_mm), 4)
+ 
++    def test_corner_touching_pieces_are_split(self):
++        import cv2
++
++        from puzzle_solver.vision import Calibration, VisionConfig, detect_pieces
++
++        pixels_per_mm = 5
++        image = np.full((750, 650, 3), (35, 35, 35), dtype=np.uint8)
++        first = np.asarray([[30, 20], [80, 20], [80, 70], [30, 70]]) * pixels_per_mm
++        second = np.asarray([[80, 70], [110, 100], [80, 130], [50, 100]]) * pixels_per_mm
++        cv2.fillPoly(image, [first.astype(np.int32)], (245, 245, 245))
++        cv2.fillPoly(image, [second.astype(np.int32)], (245, 245, 245))
++        calibration = Calibration.from_dict(
++            {
++                "mm_per_pixel": 1.0 / pixels_per_mm,
++                "roi_polygon_px": [[0, 0], [649, 0], [649, 749], [0, 749]],
++                "use_camera_intrinsics": False,
++            },
++            image.shape,
++        )
++        result = detect_pieces(
++            image,
++            calibration,
++            VisionConfig(
++                morphology_kernel_px=3,
++                min_piece_area_mm2=100.0,
++                collinear_vertex_tolerance_mm=0.5,
++            ),
++        )
++        self.assertEqual(len(result.pieces), 2)
++        self.assertTrue(all(3 <= len(piece.polygon_mm) <= 5 for piece in result.pieces))
++
+     def test_nearly_straight_false_vertex_is_removed(self):
+         from puzzle_solver.vision import _remove_nearly_straight_vertices
+ 
+diff --git a/algorithm‌/puzzle_solver/vision.py b/algorithm‌/puzzle_solver/vision.py
+index e4d21fd..977f47e 100644
+--- a/algorithm‌/puzzle_solver/vision.py
++++ b/algorithm‌/puzzle_solver/vision.py
+@@ -101,6 +101,10 @@ class VisionConfig:
+     collinear_vertex_tolerance_mm: float = 0.0
+     straight_vertex_angle_threshold_deg: float = 180.0
+     straight_vertex_max_adjacent_edge_mm: float = 0.0
++    split_touching_pieces: bool = True
++    touching_split_area_loss_ratio: float = 0.12
++    touching_split_max_erosion_mm: float = 2.5
++    touching_split_min_seed_ratio: float = 0.12
+     roi_border_margin_px: int = 0
+     max_vertices: int = 5
+     max_pieces: int = 4
+@@ -366,6 +370,74 @@ def _approximate_polygon_mm(
+     return approximation.astype(float), epsilon
+ 
+ 
++def _clean_polygon_candidate(
++    approximation: np.ndarray, config: VisionConfig, force_vertex_limit: bool = False
++) -> np.ndarray:
++    polygon = _merge_rounded_corner_vertices(
++        approximation, config.rounded_corner_max_chord_mm
++    )
++    if force_vertex_limit:
++        polygon = _merge_artifact_edges(polygon, config)
++    polygon = _remove_near_collinear_vertices(
++        polygon, config.collinear_vertex_tolerance_mm
++    )
++    return _remove_nearly_straight_vertices(
++        polygon,
++        config.straight_vertex_angle_threshold_deg,
++        config.straight_vertex_max_adjacent_edge_mm,
++    )
++
++
++def _fit_piece_polygon(
++    contour_mm: np.ndarray, config: VisionConfig
++) -> tuple[np.ndarray, float]:
++    """Choose a 3-5 vertex approximation without sacrificing real concavities."""
++
++    contour = np.asarray(contour_mm, dtype=np.float32).reshape(-1, 1, 2)
++    contour_area = abs(float(cv2.contourArea(contour)))
++    perimeter = float(cv2.arcLength(contour, True))
++    initial_epsilon = max(
++        float(config.approx_epsilon_mm),
++        float(config.approx_epsilon_perimeter_ratio) * perimeter,
++    )
++    maximum_epsilon = max(initial_epsilon, float(config.max_approx_epsilon_mm))
++
++    epsilons = [initial_epsilon]
++    while epsilons[-1] < maximum_epsilon - 1e-9:
++        epsilons.append(min(maximum_epsilon, epsilons[-1] * 1.20))
++
++    natural: list[tuple[float, float, np.ndarray]] = []
++    forced: list[tuple[float, float, np.ndarray]] = []
++    for epsilon in epsilons:
++        approximation = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2).astype(float)
++        cleaned = _clean_polygon_candidate(approximation, config)
++        if 3 <= len(cleaned) <= config.max_vertices:
++            area_error = abs(abs(float(cv2.contourArea(cleaned.astype(np.float32)))) - contour_area)
++            relative_error = area_error / max(contour_area, 1e-9)
++            natural.append((relative_error, epsilon, cleaned))
++            continue
++
++        if len(cleaned) > config.max_vertices:
++            reduced = _clean_polygon_candidate(cleaned, config, force_vertex_limit=True)
++            if 3 <= len(reduced) <= config.max_vertices:
++                area_error = abs(abs(float(cv2.contourArea(reduced.astype(np.float32)))) - contour_area)
++                relative_error = area_error / max(contour_area, 1e-9)
++                forced.append((relative_error, epsilon, reduced))
++
++    # A naturally simplified contour is safer unless it loses substantial area.
++    # The fallback handles noisy/rounded contours that never reach five vertices
++    # within the configured epsilon range.
++    pool = natural
++    if forced and (not natural or min(item[0] for item in natural) > 0.08):
++        pool = natural + forced
++    if not pool:
++        approximation, epsilon = _approximate_polygon_mm(contour_mm, config)
++        return _clean_polygon_candidate(approximation, config, force_vertex_limit=True), epsilon
++
++    _, epsilon, polygon = min(pool, key=lambda item: (item[0], item[1]))
++    return polygon, epsilon
++
++
+ def _vertex_removal_cost(polygon: np.ndarray, index: int) -> float:
+     """Measure the boundary distortion caused by removing one vertex."""
+     previous = polygon[(index - 1) % len(polygon)]
+@@ -575,6 +647,101 @@ def _pickup_point(
+     )
+ 
+ 
++def _split_touching_contour(
++    contour_px: np.ndarray,
++    image_shape: Sequence[int],
++    calibration: Calibration,
++    config: VisionConfig,
++) -> list[np.ndarray]:
++    """Split a narrow connection only when polygon fitting loses substantial area."""
++
++    if not config.split_touching_pieces or config.touching_split_max_erosion_mm <= 0.0:
++        return [contour_px]
++
++    contour_mm = calibration.pixels_to_mm(contour_px)
++    fitted, _ = _fit_piece_polygon(contour_mm, config)
++    contour_area = abs(float(cv2.contourArea(contour_mm.astype(np.float32))))
++    fitted_area = abs(float(cv2.contourArea(fitted.astype(np.float32))))
++    area_mismatch = abs(contour_area - fitted_area) / max(contour_area, 1e-9)
++    if area_mismatch < config.touching_split_area_loss_ratio:
++        return [contour_px]
++
++    x, y, width, height = cv2.boundingRect(contour_px.astype(np.float32))
++    padding = 2
++    x0 = max(0, x - padding)
++    y0 = max(0, y - padding)
++    x1 = min(image_shape[1], x + width + padding)
++    y1 = min(image_shape[0], y + height + padding)
++    local = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
++    shifted = np.rint(contour_px - [x0, y0]).astype(np.int32)
++    cv2.fillPoly(local, [shifted], 255)
++    original_pixels = int(np.count_nonzero(local))
++
++    centre = np.mean(contour_px, axis=0)
++    nearby_mm = calibration.pixels_to_mm(
++        np.asarray([centre, centre + [1.0, 0.0], centre + [0.0, 1.0]])
++    )
++    mm_per_pixel = 0.5 * (
++        np.linalg.norm(nearby_mm[1] - nearby_mm[0])
++        + np.linalg.norm(nearby_mm[2] - nearby_mm[0])
++    )
++    maximum_radius_px = max(
++        1, int(math.ceil(config.touching_split_max_erosion_mm / max(mm_per_pixel, 1e-9)))
++    )
++
++    for radius in range(1, maximum_radius_px + 1):
++        size = radius * 2 + 1
++        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
++        eroded = cv2.erode(local, kernel, iterations=1)
++        count, labels, stats, _ = cv2.connectedComponentsWithStats(eroded)
++        minimum_seed_pixels = original_pixels * config.touching_split_min_seed_ratio
++        seed_labels = [
++            label
++            for label in range(1, count)
++            if stats[label, cv2.CC_STAT_AREA] >= minimum_seed_pixels
++        ]
++        if not 2 <= len(seed_labels) <= config.max_pieces:
++            continue
++
++        distances = []
++        for label in seed_labels:
++            seed = np.where(labels == label, 0, 255).astype(np.uint8)
++            distances.append(cv2.distanceTransform(seed, cv2.DIST_L2, cv2.DIST_MASK_PRECISE))
++        ownership = np.argmin(np.stack(distances), axis=0)
++
++        pieces: list[np.ndarray] = []
++        valid = True
++        for owner in range(len(seed_labels)):
++            component = np.where((local != 0) & (ownership == owner), 255, 0).astype(np.uint8)
++            component_contours, _ = cv2.findContours(
++                component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
++            )
++            if not component_contours:
++                valid = False
++                break
++            piece = max(component_contours, key=cv2.contourArea).reshape(-1, 2).astype(float)
++            piece += [x0, y0]
++            piece_mm = calibration.pixels_to_mm(piece)
++            piece_area = abs(float(cv2.contourArea(piece_mm.astype(np.float32))))
++            piece_polygon, _ = _fit_piece_polygon(piece_mm, config)
++            piece_polygon_area = abs(
++                float(cv2.contourArea(piece_polygon.astype(np.float32)))
++            )
++            piece_mismatch = abs(piece_area - piece_polygon_area) / max(piece_area, 1e-9)
++            if (
++                not config.min_piece_area_mm2 <= piece_area <= config.max_piece_area_mm2
++                or not 3 <= len(piece_polygon) <= config.max_vertices
++                or piece_mismatch >= area_mismatch
++            ):
++                valid = False
++                break
++            pieces.append(piece)
++        if valid:
++            return pieces
++
++    return [contour_px]
++
++
+ def detect_pieces(
+     image_bgr: np.ndarray,
+     calibration: Calibration,
+@@ -584,6 +751,13 @@ def detect_pieces(
+     image_bgr = calibration.undistort_image(image_bgr)
+     mask, roi = segment_white_pieces(image_bgr, calibration, config)
+     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
++    split_contours: list[np.ndarray] = []
++    for contour in contours:
++        points = contour.reshape(-1, 2).astype(float)
++        split_contours.extend(
++            _split_touching_contour(points, image_bgr.shape, calibration, config)
++        )
++    contours = [contour.reshape(-1, 1, 2) for contour in split_contours]
+     border_margin = max(0, int(config.roi_border_margin_px))
+     inner_roi = roi
+     if border_margin:
+@@ -621,19 +795,7 @@ def detect_pieces(
+             polygon_source_mm = cv2.convexHull(
+                 contour_mm.astype(np.float32).reshape(-1, 1, 2)
+             ).reshape(-1, 2)
+-        polygon_mm, epsilon = _approximate_polygon_mm(polygon_source_mm, config)
+-        polygon_mm = _merge_rounded_corner_vertices(
+-            polygon_mm, config.rounded_corner_max_chord_mm
+-        )
+-        polygon_mm = _merge_artifact_edges(polygon_mm, config)
+-        polygon_mm = _remove_near_collinear_vertices(
+-            polygon_mm, config.collinear_vertex_tolerance_mm
+-        )
+-        polygon_mm = _remove_nearly_straight_vertices(
+-            polygon_mm,
+-            config.straight_vertex_angle_threshold_deg,
+-            config.straight_vertex_max_adjacent_edge_mm,
+-        )
++        polygon_mm, epsilon = _fit_piece_polygon(polygon_source_mm, config)
+         if not 3 <= len(polygon_mm) <= config.max_vertices:
+             rejected.append(RejectedContour(contour_px, f"顶点 {len(polygon_mm)}（最大 {config.max_vertices}）"))
+             continue

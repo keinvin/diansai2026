@@ -5,6 +5,7 @@ import numpy as np
 
 from puzzle_solver.solver import (
     SolverConfig,
+    _resolve_placement_overlaps,
     _score_edge_patterns,
     polygon_area,
     solve_puzzle,
@@ -20,6 +21,21 @@ PIECES = [
 
 
 class SolverTest(unittest.TestCase):
+    def test_pairwise_repulsion_removes_residual_overlap(self):
+        polygons = [
+            np.asarray([[0, 0], [50, 0], [50, 30], [0, 30]], dtype=float),
+            np.asarray([[48, 0], [98, 0], [98, 30], [48, 30]], dtype=float),
+        ]
+        placed, offsets, overlap = _resolve_placement_overlaps(
+            polygons,
+            [np.zeros(2), np.zeros(2)],
+            maximum_offset_mm=8.0,
+            tolerance_mm2=0.25,
+        )
+        self.assertLessEqual(overlap, 0.25)
+        self.assertTrue(all(np.linalg.norm(offset) <= 8.0 + 1e-9 for offset in offsets))
+        self.assertEqual(len(placed), 2)
+
     def test_fixed_four_piece_example(self):
         result = solve_puzzle(
             PIECES,
@@ -94,6 +110,27 @@ class SolverTest(unittest.TestCase):
         )
         self.assertGreater(evidence, 0.5)
         self.assertLess(mismatch, 1e-9)
+
+    def test_sparse_print_mismatch_is_not_diluted_by_white_samples(self):
+        white = np.full((48, 3), 240.0)
+        printed = white.copy()
+        printed[20:26] = [25.0, 128.0, 128.0]
+        adjacency = {
+            "piece_a": 0,
+            "piece_b": 1,
+            "edge_a": 0,
+            "edge_b": 0,
+            "edge_b_reversed": False,
+            "edge_a_interval": [0.0, 1.0],
+            "edge_b_interval": [0.0, 1.0],
+        }
+
+        _, mismatch, evidence = _score_edge_patterns(
+            [adjacency], [[printed], [white]]
+        )
+
+        self.assertGreater(evidence, 0.5)
+        self.assertGreater(mismatch, 0.05)
 
 
 if __name__ == "__main__":
