@@ -64,16 +64,69 @@ SCREEN_CORNER_NAMES = ("屏幕左上", "屏幕右上（被遮挡）", "屏幕右
 A4_FROM_SCREEN = (1, 2, 3, 0)  # A4 TL/TR/BR/BL = screen TR/BR/BL/TL
 
 
-def draw_solution_overlay(image_bgr: np.ndarray, solution: dict, calibration: Calibration) -> np.ndarray:
-    """Draw the assembled target rectangle in its physical A4 position."""
+def _warp_piece_into_target(
+    source_image: np.ndarray,
+    source_piece: object,
+    target_polygon_px: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Project one detected source piece into its solved target polygon."""
+
+    source_polygon_px = np.asarray(source_piece.polygon_px, dtype=np.float32)
+    target_polygon_px = np.asarray(target_polygon_px, dtype=np.float32)
+    if source_polygon_px.shape != target_polygon_px.shape or len(source_polygon_px) < 3:
+        return None
+    source_mask = np.zeros(source_image.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(
+        source_mask,
+        [np.round(source_piece.contour_px).astype(np.int32)],
+        255,
+    )
+    size = (source_image.shape[1], source_image.shape[0])
+    if len(source_polygon_px) == 3:
+        transform = cv2.getAffineTransform(source_polygon_px, target_polygon_px)
+        warped_image = cv2.warpAffine(source_image, transform, size, flags=cv2.INTER_LINEAR)
+        warped_mask = cv2.warpAffine(source_mask, transform, size, flags=cv2.INTER_NEAREST)
+    else:
+        transform, _ = cv2.findHomography(source_polygon_px, target_polygon_px, method=0)
+        if transform is None:
+            return None
+        warped_image = cv2.warpPerspective(source_image, transform, size, flags=cv2.INTER_LINEAR)
+        warped_mask = cv2.warpPerspective(source_mask, transform, size, flags=cv2.INTER_NEAREST)
+    return warped_image, warped_mask
+
+
+def draw_solution_overlay(
+    image_bgr: np.ndarray,
+    solution: dict,
+    calibration: Calibration,
+    *,
+    source_image: np.ndarray | None = None,
+    source_pieces: list[object] | None = None,
+    show_piece_images: bool = False,
+) -> np.ndarray:
+    """Draw the solved target, optionally with each source piece projected into it."""
+
     overlay = image_bgr.copy()
     fill_layer = overlay.copy()
     palette = [(255, 130, 30), (40, 190, 70), (40, 80, 235), (190, 70, 190)]
+    source_by_id = {
+        piece.id: piece for piece in (source_pieces or [])
+    }
     for index, piece in enumerate(solution["pieces"]):
         polygon_mm = np.asarray(piece["target_polygon_mm"], dtype=float)
         polygon_px = np.round(calibration.mm_to_pixels(polygon_mm)).astype(np.int32)
         colour = palette[index % len(palette)]
-        cv2.fillPoly(fill_layer, [polygon_px], colour)
+        source_piece = source_by_id.get(piece["id"])
+        rendered_piece = (
+            _warp_piece_into_target(source_image, source_piece, polygon_px)
+            if show_piece_images and source_image is not None and source_piece is not None
+            else None
+        )
+        if rendered_piece is None:
+            cv2.fillPoly(fill_layer, [polygon_px], colour)
+        else:
+            warped_image, warped_mask = rendered_piece
+            overlay[warped_mask != 0] = warped_image[warped_mask != 0]
         cv2.polylines(overlay, [polygon_px], True, colour, 3, cv2.LINE_AA)
         centre = np.round(polygon_px.mean(axis=0)).astype(int)
         cv2.putText(
@@ -86,7 +139,8 @@ def draw_solution_overlay(image_bgr: np.ndarray, solution: dict, calibration: Ca
             2,
             cv2.LINE_AA,
         )
-    overlay = cv2.addWeighted(fill_layer, 0.25, overlay, 0.75, 0.0)
+    if not show_piece_images:
+        overlay = cv2.addWeighted(fill_layer, 0.25, overlay, 0.75, 0.0)
     rectangle = solution["rectangle"]
     x0, y0 = rectangle["origin_mm"]
     x1 = x0 + rectangle["width_mm"]
@@ -109,6 +163,7 @@ class RecognitionWorker(QObject):
         puzzle_search_enabled: bool,
         transport_only: bool,
         use_piece_features: bool,
+        show_piece_images: bool,
     ) -> None:
         super().__init__()
         self._frame = frame
@@ -116,6 +171,7 @@ class RecognitionWorker(QObject):
         self._puzzle_search_enabled = puzzle_search_enabled
         self._transport_only = transport_only
         self._use_piece_features = use_piece_features
+        self._show_piece_images = show_piece_images
 
     @Slot()
     def run(self) -> None:
@@ -133,7 +189,14 @@ class RecognitionWorker(QObject):
             run.corrected_frame, run.result, run.calibration
         )
         if run.solution is not None:
-            overlay = draw_solution_overlay(overlay, run.solution, run.calibration)
+            overlay = draw_solution_overlay(
+                overlay,
+                run.solution,
+                run.calibration,
+                source_image=run.corrected_frame,
+                source_pieces=run.result.pieces,
+                show_piece_images=self._show_piece_images,
+            )
         self.completed.emit(
             {
                 "result": run.result,
@@ -294,6 +357,7 @@ class RecognitionWindow(QMainWindow):
         self._motion_thread: QThread | None = None
         self._motion_worker: MotionWorker | None = None
         self._task_mode: str | None = None
+        self._one_click_execute_pending = False
 
         self._camera = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not self._camera.isOpened():
@@ -301,6 +365,7 @@ class RecognitionWindow(QMainWindow):
         self._camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self._camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self._camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self._camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         self.setWindowTitle("拼图识别")
         self._build_ui()
@@ -332,6 +397,10 @@ class RecognitionWindow(QMainWindow):
         menu_hint.setObjectName("menuHint")
         menu_hint.setAlignment(Qt.AlignCenter)
         menu_layout.addWidget(menu_hint)
+        menu_exit_button = QPushButton("退出")
+        menu_exit_button.setObjectName("exitButton")
+        menu_exit_button.clicked.connect(self.close)
+        menu_layout.addWidget(menu_exit_button, 0, Qt.AlignRight)
         task_grid = QGridLayout()
         task_grid.setHorizontalSpacing(22)
         task_grid.setVerticalSpacing(22)
@@ -344,7 +413,7 @@ class RecognitionWindow(QMainWindow):
         for index, (title, hint, mode) in enumerate(task_buttons):
             button = QPushButton(f"{title}\n{hint}")
             button.setObjectName("taskButton")
-            button.setMinimumHeight(150)
+            button.setMinimumHeight(180)
             button.clicked.connect(lambda _checked=False, value=mode: self._select_task(value))
             task_grid.addWidget(button, index // 2, index % 2)
         menu_layout.addLayout(task_grid, 1)
@@ -362,6 +431,10 @@ class RecognitionWindow(QMainWindow):
         self._workspace_title = QLabel()
         self._workspace_title.setObjectName("workspaceTitle")
         header.addWidget(self._workspace_title, 1)
+        exit_button = QPushButton("退出")
+        exit_button.setObjectName("exitButton")
+        exit_button.clicked.connect(self.close)
+        header.addWidget(exit_button)
         workspace_layout.addLayout(header)
 
         layout = QHBoxLayout()
@@ -374,7 +447,7 @@ class RecognitionWindow(QMainWindow):
 
         side = QFrame()
         side.setObjectName("sidebar")
-        side.setFixedWidth(300)
+        side.setFixedWidth(360)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(18, 18, 18, 18)
         side_layout.setSpacing(12)
@@ -384,8 +457,13 @@ class RecognitionWindow(QMainWindow):
         self._status.setObjectName("status")
         side_layout.addWidget(self._status)
 
-        self._recognize_button = QPushButton("识别当前画面")
-        self._recognize_button.clicked.connect(self._recognize)
+        self._one_click_button = QPushButton("一键启动")
+        self._one_click_button.setObjectName("oneClickButton")
+        self._one_click_button.clicked.connect(self._one_click_start)
+        side_layout.addWidget(self._one_click_button)
+
+        self._recognize_button = QPushButton("仅识别并生成方案")
+        self._recognize_button.clicked.connect(self._recognize_manually)
         side_layout.addWidget(self._recognize_button)
 
         self._execute_button = QPushButton("确认并执行拼图")
@@ -402,6 +480,15 @@ class RecognitionWindow(QMainWindow):
         self._region_selector.setCurrentIndex(index if index >= 0 else 0)
         self._region_selector.currentIndexChanged.connect(self._set_a4_region)
         side_layout.addWidget(self._region_selector)
+
+        self._show_piece_images_checkbox = QCheckBox("拼接区显示原始图案")
+        self._show_piece_images_checkbox.setChecked(
+            bool(self._document.get("show_solution_piece_images", False))
+        )
+        self._show_piece_images_checkbox.toggled.connect(
+            self._set_show_piece_images
+        )
+        side_layout.addWidget(self._show_piece_images_checkbox)
 
         self._puzzle_search_checkbox = QCheckBox("启用拼图搜索")
         self._puzzle_search_checkbox.setChecked(
@@ -458,19 +545,16 @@ class RecognitionWindow(QMainWindow):
         self._details.setObjectName("details")
         side_layout.addWidget(self._details)
         side_layout.addStretch(1)
-
-        exit_button = QPushButton("退出")
-        exit_button.setObjectName("exitButton")
-        exit_button.clicked.connect(self.close)
-        side_layout.addWidget(exit_button)
         layout.addWidget(side)
         workspace_layout.addLayout(layout, 1)
         self._pages.addWidget(workspace)
 
         self._task_controls = [
+            self._one_click_button,
             self._recognize_button,
             self._execute_button,
             self._region_selector,
+            self._show_piece_images_checkbox,
             self._retake_button,
         ]
         self._configuration_controls = [
@@ -487,19 +571,22 @@ class RecognitionWindow(QMainWindow):
         self.setStyleSheet(
             "QMainWindow { background: #171a20; color: #eef2f7; }"
             "#sidebar { background: #242933; border: 1px solid #394150; }"
-            "#menuTitle { font-size: 38px; font-weight: 700; color: #ffffff; }"
-            "#menuHint { font-size: 19px; color: #b8c2d1; }"
-            "#workspaceTitle { font-size: 26px; font-weight: 700; color: #ffffff; }"
-            "#status { font-size: 16px; color: #d3dae5; min-height: 70px; }"
-            "#details { font-size: 15px; color: #b8c2d1; padding-top: 12px; }"
+            "#menuTitle { font-size: 50px; font-weight: 700; color: #ffffff; }"
+            "#menuHint { font-size: 24px; color: #b8c2d1; }"
+            "#workspaceTitle { font-size: 34px; font-weight: 700; color: #ffffff; }"
+            "#status { font-size: 20px; color: #d3dae5; min-height: 76px; }"
+            "#details { font-size: 17px; color: #b8c2d1; padding-top: 12px; }"
             "QPushButton { background: #2d6a9f; border: 0; padding: 13px 12px;"
-            " color: white; font-size: 16px; }"
-            "#taskButton { background: #285b84; font-size: 22px; font-weight: 700; text-align: left; padding: 22px; }"
+            " color: white; font-size: 20px; }"
+            "#taskButton { background: #285b84; font-size: 28px; font-weight: 700; text-align: left; padding: 26px; }"
             "#taskButton:pressed { background: #1e4d77; }"
-            "#backButton { background: #465465; font-size: 15px; }"
+            "#backButton { background: #465465; font-size: 18px; }"
             "QPushButton:disabled { background: #4a505a; color: #c0c4cb; }"
             "QPushButton:pressed { background: #1e4d77; }"
-            "QCheckBox { color: #d3dae5; font-size: 16px; padding: 6px 2px; }"
+            "QComboBox { font-size: 20px; padding: 8px; }"
+            "QCheckBox { color: #d3dae5; font-size: 20px; padding: 6px 2px; }"
+            "#oneClickButton { background: #16734a; font-size: 24px; font-weight: 700; padding: 18px 12px; }"
+            "#oneClickButton:pressed { background: #0e5235; }"
             "#executeButton { background: #a66616; font-weight: 700; }"
             "#executeButton:pressed { background: #75480d; }"
             "#exitButton { background: #9b3a3a; }"
@@ -512,6 +599,7 @@ class RecognitionWindow(QMainWindow):
             return
         self._frozen = False
         self._latest_solution = None
+        self._one_click_execute_pending = False
         self._pages.setCurrentIndex(0)
 
     def _select_task(self, mode: str) -> None:
@@ -534,7 +622,13 @@ class RecognitionWindow(QMainWindow):
         self._execute_button.setText(
             "确认并执行搬运" if mode == "transport" else "确认并执行拼图"
         )
+        self._one_click_button.setText(
+            "一键启动：识别并搬运"
+            if mode == "transport"
+            else "一键启动：识别并拼图"
+        )
         self._latest_solution = None
+        self._one_click_execute_pending = False
         self._execute_button.setEnabled(False)
         self._details.clear()
         self._frozen = False
@@ -544,12 +638,22 @@ class RecognitionWindow(QMainWindow):
     def _read_frame(self) -> None:
         if self._frozen:
             return
-        ok, frame = self._camera.read()
-        if not ok or frame is None:
+        frame = self._read_latest_camera_frame()
+        if frame is None:
             self._status.setText("摄像头画面读取失败")
             return
         self._latest_frame = frame
         self._view.set_image(frame, self._corners)
+
+    def _read_latest_camera_frame(self, discard_count: int = 0) -> np.ndarray | None:
+        """Drain queued V4L2 frames so a new recognition never uses a frozen view."""
+        frame: np.ndarray | None = None
+        for _ in range(max(0, discard_count) + 1):
+            ok, candidate = self._camera.read()
+            if not ok or candidate is None:
+                return frame
+            frame = candidate
+        return frame
 
     def _start_calibration(self) -> None:
         if self._recognition_thread is not None:
@@ -585,6 +689,12 @@ class RecognitionWindow(QMainWindow):
         self._execute_button.setEnabled(False)
         self._details.clear()
         self._update_status()
+
+    def _set_show_piece_images(self, enabled: bool) -> None:
+        if self._recognition_thread is not None or self._motion_thread is not None:
+            return
+        self._document["show_solution_piece_images"] = bool(enabled)
+        self._save_document_fields("show_solution_piece_images")
 
     def _clear_calibration(self) -> None:
         if self._recognition_thread is not None:
@@ -720,15 +830,21 @@ class RecognitionWindow(QMainWindow):
 
     def _recognize(self) -> None:
         if (
-            self._latest_frame is None
-            or len(self._corners) != 4
+            len(self._corners) != 4
             or sum(point is not None for point in self._corners) < 3
             or self._recognition_thread is not None
         ):
             return
         self._latest_solution = None
         self._execute_button.setEnabled(False)
-        frame = self._latest_frame.copy()
+        fresh_frame = self._read_latest_camera_frame(discard_count=7)
+        if fresh_frame is None:
+            self._status.setText("摄像头画面读取失败，未开始识别")
+            self._one_click_execute_pending = False
+            return
+        self._latest_frame = fresh_frame
+        self._view.set_image(fresh_frame, self._corners)
+        frame = fresh_frame.copy()
         self._recognition_example_path = None
         self._recognition_example_error = None
         try:
@@ -738,12 +854,15 @@ class RecognitionWindow(QMainWindow):
         except (OSError, RuntimeError, ValueError) as error:
             self._recognition_example_error = str(error)
         self._frozen = False
+        self._one_click_button.setEnabled(False)
         self._recognize_button.setEnabled(False)
         self._region_selector.setEnabled(False)
+        self._show_piece_images_checkbox.setEnabled(False)
         self._puzzle_search_checkbox.setEnabled(False)
         transport_only = self._task_mode == "transport"
         puzzle_search_enabled = not transport_only
         use_piece_features = self._task_mode == "card_puzzle"
+        show_piece_images = self._show_piece_images_checkbox.isChecked()
         if transport_only:
             self._status.setText("正在识别碎片并生成搬运位置……")
         else:
@@ -755,6 +874,7 @@ class RecognitionWindow(QMainWindow):
             puzzle_search_enabled,
             transport_only,
             use_piece_features,
+            show_piece_images,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -769,6 +889,14 @@ class RecognitionWindow(QMainWindow):
         self._recognition_thread = thread
         self._recognition_worker = worker
         thread.start()
+
+    def _recognize_manually(self) -> None:
+        self._one_click_execute_pending = False
+        self._recognize()
+
+    def _one_click_start(self) -> None:
+        self._one_click_execute_pending = True
+        self._recognize()
 
     @Slot(object)
     def _recognition_completed(self, payload: dict) -> None:
@@ -856,14 +984,23 @@ class RecognitionWindow(QMainWindow):
         self._status.setText(f"识别或规划失败：{error}{suffix}")
         self._details.clear()
         self._frozen = False
+        self._one_click_execute_pending = False
 
     @Slot()
     def _recognition_thread_finished(self) -> None:
         self._recognition_thread = None
         self._recognition_worker = None
         self._region_selector.setEnabled(True)
+        self._show_piece_images_checkbox.setEnabled(True)
         self._puzzle_search_checkbox.setEnabled(True)
+        self._one_click_button.setEnabled(True)
         self._recognize_button.setEnabled(True)
+        execute_after_recognition = (
+            self._one_click_execute_pending and self._latest_solution is not None
+        )
+        self._one_click_execute_pending = False
+        if execute_after_recognition:
+            self._execute_solution()
 
     def _execute_solution(self) -> None:
         if self._latest_solution is None or self._motion_thread is not None:
@@ -899,8 +1036,10 @@ class RecognitionWindow(QMainWindow):
             return
 
         self._execute_button.setEnabled(False)
+        self._one_click_button.setEnabled(False)
         self._recognize_button.setEnabled(False)
         self._region_selector.setEnabled(False)
+        self._show_piece_images_checkbox.setEnabled(False)
         self._puzzle_search_checkbox.setEnabled(False)
         self._status.setText("正在初始化 GRBL、舵机和电磁铁……")
         thread = QThread(self)
@@ -956,7 +1095,9 @@ class RecognitionWindow(QMainWindow):
         self._motion_thread = None
         self._motion_worker = None
         self._region_selector.setEnabled(True)
+        self._show_piece_images_checkbox.setEnabled(True)
         self._puzzle_search_checkbox.setEnabled(True)
+        self._one_click_button.setEnabled(True)
         self._recognize_button.setEnabled(True)
 
     def _save_snapshot(self) -> None:
@@ -980,6 +1121,7 @@ class RecognitionWindow(QMainWindow):
             return
         self._frozen = False
         self._latest_solution = None
+        self._one_click_execute_pending = False
         self._execute_button.setEnabled(False)
         self._details.clear()
         self._update_status()

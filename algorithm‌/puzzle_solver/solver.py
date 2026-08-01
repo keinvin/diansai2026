@@ -980,6 +980,81 @@ def _assembly_is_connected(piece_count: int, adjacencies: Sequence[dict]) -> boo
     return len(visited) == piece_count
 
 
+def _point_to_segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    edge = end - start
+    length_squared = float(np.dot(edge, edge))
+    if length_squared <= 1e-12:
+        return float(np.linalg.norm(point - start))
+    fraction = float(np.clip(np.dot(point - start, edge) / length_squared, 0.0, 1.0))
+    return float(np.linalg.norm(point - (start + fraction * edge)))
+
+
+def _segments_intersect(
+    first_start: np.ndarray,
+    first_end: np.ndarray,
+    second_start: np.ndarray,
+    second_end: np.ndarray,
+) -> bool:
+    """Return whether two closed line segments touch or cross."""
+
+    def cross(origin: np.ndarray, first: np.ndarray, second: np.ndarray) -> float:
+        first_delta = first - origin
+        second_delta = second - origin
+        return float(
+            first_delta[0] * second_delta[1]
+            - first_delta[1] * second_delta[0]
+        )
+
+    def on_segment(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> bool:
+        return (
+            min(start[0], end[0]) - 1e-9 <= point[0] <= max(start[0], end[0]) + 1e-9
+            and min(start[1], end[1]) - 1e-9 <= point[1] <= max(start[1], end[1]) + 1e-9
+        )
+
+    first_a = cross(first_start, first_end, second_start)
+    first_b = cross(first_start, first_end, second_end)
+    second_a = cross(second_start, second_end, first_start)
+    second_b = cross(second_start, second_end, first_end)
+    if first_a * first_b < 0.0 and second_a * second_b < 0.0:
+        return True
+    return (
+        (abs(first_a) <= 1e-9 and on_segment(second_start, first_start, first_end))
+        or (abs(first_b) <= 1e-9 and on_segment(second_end, first_start, first_end))
+        or (abs(second_a) <= 1e-9 and on_segment(first_start, second_start, second_end))
+        or (abs(second_b) <= 1e-9 and on_segment(first_end, second_start, second_end))
+    )
+
+
+def _polygon_edge_distance(first: np.ndarray, second: np.ndarray) -> float:
+    """Return the shortest physical distance between two simple polygon edges."""
+
+    minimum = math.inf
+    for first_index, first_start in enumerate(first):
+        first_end = first[(first_index + 1) % len(first)]
+        for second_index, second_start in enumerate(second):
+            second_end = second[(second_index + 1) % len(second)]
+            if _segments_intersect(first_start, first_end, second_start, second_end):
+                return 0.0
+            minimum = min(
+                minimum,
+                _point_to_segment_distance(first_start, second_start, second_end),
+                _point_to_segment_distance(first_end, second_start, second_end),
+                _point_to_segment_distance(second_start, first_start, first_end),
+                _point_to_segment_distance(second_end, first_start, first_end),
+            )
+    return minimum
+
+
+def _minimum_piece_clearance(polygons: Sequence[np.ndarray]) -> float:
+    if len(polygons) < 2:
+        return math.inf
+    return min(
+        _polygon_edge_distance(first, second)
+        for first_index, first in enumerate(polygons)
+        for second in polygons[first_index + 1 :]
+    )
+
+
 def _apply_safe_placement_gap(
     polygons: Sequence[np.ndarray],
     piece_ids: Sequence[str],
@@ -1008,12 +1083,17 @@ def _apply_safe_placement_gap(
             <= config.max_adjacent_vertex_distance_mm
             for adjacency in checked_adjacencies
         )
-        if overlap_area <= config.final_overlap_tolerance_mm2 and vertices_valid:
+        clearance_valid = _minimum_piece_clearance(placed) + 1e-6 >= requested_gap
+        if (
+            overlap_area <= config.final_overlap_tolerance_mm2
+            and vertices_valid
+            and clearance_valid
+        ):
             return placed, offsets, checked_adjacencies, float(gap), overlap_area
 
     raise RuntimeError(
-        "A geometric assembly was found, but no safe non-overlapping placement "
-        "satisfied the adjacent-vertex distance limit"
+        "A geometric assembly was found, but no safe placement satisfied the "
+        "clearance and adjacent-vertex distance limits"
     )
 
 
