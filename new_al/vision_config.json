@@ -85,7 +85,7 @@
   "motion": {
     "z_down_mm": 30.0,
     "z_retracted_mm": 0.0,
-    "xy_feed_mm_min": 15000.0,
+    "xy_feed_mm_min": 20000.0,
     "z_feed_mm_min": 5000.0,
     "servo_direction": -1.0,
     "servo_zero_deg": 0.0,

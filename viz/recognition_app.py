@@ -10,6 +10,7 @@ import sys
 import sysconfig
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 
 import cv2
 import numpy as np
@@ -20,7 +21,17 @@ _pyside_plugins = Path(sysconfig.get_paths()["purelib"]) / "PySide6" / "Qt" / "p
 if _pyside_plugins.is_dir():
     os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(_pyside_plugins)
 
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import (
+    QObject,
+    QPointF,
+    QProcess,
+    QRectF,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -59,6 +70,7 @@ from test.locate_red_a4 import locate_red_a4  # noqa: E402
 
 
 RED_A4_CORNERS_PATH = PROJECT_ROOT / "data" / "red_a4_corners.json"
+FINISHED_SOUND_PATH = Path(__file__).with_name("finished.wav")
 # Keep manual calibration identical to test/locate_red_a4.py.
 SCREEN_CORNER_NAMES = ("屏幕左上", "屏幕右上（被遮挡）", "屏幕右下", "屏幕左下")
 A4_FROM_SCREEN = (1, 2, 3, 0)  # A4 TL/TR/BR/BL = screen TR/BR/BL/TL
@@ -358,6 +370,8 @@ class RecognitionWindow(QMainWindow):
         self._motion_worker: MotionWorker | None = None
         self._task_mode: str | None = None
         self._one_click_execute_pending = False
+        self._one_click_started_at: float | None = None
+        self._finished_sound_process = QProcess(self)
 
         self._camera = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not self._camera.isOpened():
@@ -456,6 +470,15 @@ class RecognitionWindow(QMainWindow):
         self._status.setWordWrap(True)
         self._status.setObjectName("status")
         side_layout.addWidget(self._status)
+
+        self._one_click_elapsed = QLabel("运行计时 0 s")
+        self._one_click_elapsed.setObjectName("runTimer")
+        self._one_click_elapsed.setAlignment(Qt.AlignCenter)
+        self._one_click_elapsed.setVisible(False)
+        side_layout.addWidget(self._one_click_elapsed)
+        self._one_click_timer = QTimer(self)
+        self._one_click_timer.setInterval(1000)
+        self._one_click_timer.timeout.connect(self._update_one_click_elapsed)
 
         self._one_click_button = QPushButton("一键启动")
         self._one_click_button.setObjectName("oneClickButton")
@@ -567,6 +590,11 @@ class RecognitionWindow(QMainWindow):
             self._grbl_calibration_button,
             self._servo_calibration_button,
         ]
+        # Only one control group is used at a time. Hiding the configuration
+        # group initially keeps the inactive workspace from forcing the task
+        # menu taller than the physical screen on first launch.
+        for control in self._configuration_controls:
+            control.setVisible(False)
 
         self.setStyleSheet(
             "QMainWindow { background: #171a20; color: #eef2f7; }"
@@ -575,6 +603,8 @@ class RecognitionWindow(QMainWindow):
             "#menuHint { font-size: 24px; color: #b8c2d1; }"
             "#workspaceTitle { font-size: 34px; font-weight: 700; color: #ffffff; }"
             "#status { font-size: 20px; color: #d3dae5; min-height: 76px; }"
+            "#runTimer { background: #0f6b48; border: 2px solid #41d39a;"
+            " color: #ffffff; font-size: 34px; font-weight: 700; padding: 14px 8px; }"
             "#details { font-size: 17px; color: #b8c2d1; padding-top: 12px; }"
             "QPushButton { background: #2d6a9f; border: 0; padding: 13px 12px;"
             " color: white; font-size: 20px; }"
@@ -611,6 +641,7 @@ class RecognitionWindow(QMainWindow):
             control.setVisible(not is_configuration)
         for control in self._configuration_controls:
             control.setVisible(is_configuration)
+        self._reset_one_click_elapsed()
         self._puzzle_search_checkbox.setVisible(False)
         title_by_mode = {
             "transport": "第一题：碎片搬运",
@@ -828,20 +859,20 @@ class RecognitionWindow(QMainWindow):
         if self._latest_frame is not None:
             self._view.set_image(self._latest_frame, self._corners)
 
-    def _recognize(self) -> None:
+    def _recognize(self) -> bool:
         if (
             len(self._corners) != 4
             or sum(point is not None for point in self._corners) < 3
             or self._recognition_thread is not None
         ):
-            return
+            return False
         self._latest_solution = None
         self._execute_button.setEnabled(False)
         fresh_frame = self._read_latest_camera_frame(discard_count=7)
         if fresh_frame is None:
             self._status.setText("摄像头画面读取失败，未开始识别")
             self._one_click_execute_pending = False
-            return
+            return False
         self._latest_frame = fresh_frame
         self._view.set_image(fresh_frame, self._corners)
         frame = fresh_frame.copy()
@@ -889,6 +920,7 @@ class RecognitionWindow(QMainWindow):
         self._recognition_thread = thread
         self._recognition_worker = worker
         thread.start()
+        return True
 
     def _recognize_manually(self) -> None:
         self._one_click_execute_pending = False
@@ -896,7 +928,37 @@ class RecognitionWindow(QMainWindow):
 
     def _one_click_start(self) -> None:
         self._one_click_execute_pending = True
-        self._recognize()
+        self._start_one_click_elapsed()
+        if not self._recognize():
+            self._one_click_execute_pending = False
+            self._reset_one_click_elapsed()
+
+    def _start_one_click_elapsed(self) -> None:
+        self._one_click_timer.stop()
+        self._one_click_started_at = monotonic()
+        self._one_click_elapsed.setText("运行计时 0 s")
+        self._one_click_elapsed.setVisible(True)
+        self._one_click_timer.start()
+
+    @Slot()
+    def _update_one_click_elapsed(self) -> None:
+        if self._one_click_started_at is None:
+            return
+        elapsed = max(0, int(monotonic() - self._one_click_started_at))
+        self._one_click_elapsed.setText(f"运行计时 {elapsed} s")
+
+    def _stop_one_click_elapsed(self, prefix: str) -> None:
+        if self._one_click_started_at is None:
+            return
+        elapsed = max(0, int(monotonic() - self._one_click_started_at))
+        self._one_click_timer.stop()
+        self._one_click_started_at = None
+        self._one_click_elapsed.setText(f"{prefix} {elapsed} s")
+
+    def _reset_one_click_elapsed(self) -> None:
+        self._one_click_timer.stop()
+        self._one_click_started_at = None
+        self._one_click_elapsed.setVisible(False)
 
     @Slot(object)
     def _recognition_completed(self, payload: dict) -> None:
@@ -985,6 +1047,7 @@ class RecognitionWindow(QMainWindow):
         self._details.clear()
         self._frozen = False
         self._one_click_execute_pending = False
+        self._stop_one_click_elapsed("结束用时")
 
     @Slot()
     def _recognition_thread_finished(self) -> None:
@@ -995,26 +1058,30 @@ class RecognitionWindow(QMainWindow):
         self._puzzle_search_checkbox.setEnabled(True)
         self._one_click_button.setEnabled(True)
         self._recognize_button.setEnabled(True)
-        execute_after_recognition = (
-            self._one_click_execute_pending and self._latest_solution is not None
-        )
+        one_click_requested = self._one_click_execute_pending
+        execute_after_recognition = one_click_requested and self._latest_solution is not None
         self._one_click_execute_pending = False
         if execute_after_recognition:
-            self._execute_solution()
+            self._execute_solution(skip_confirmation=True)
+        elif one_click_requested:
+            self._stop_one_click_elapsed("结束用时")
 
-    def _execute_solution(self) -> None:
+    def _execute_solution(self, *, skip_confirmation: bool = False) -> None:
         if self._latest_solution is None or self._motion_thread is not None:
+            if skip_confirmation:
+                self._stop_one_click_elapsed("结束用时")
             return
         try:
             pipeline = MainPipeline(self._document)
             plan = pipeline.build_motion_plan(self._latest_solution)
         except Exception as exc:
             self._status.setText(f"无法生成抓取计划：{exc}")
+            if skip_confirmation:
+                self._stop_one_click_elapsed("结束用时")
             return
 
         motion_config = pipeline.motion_config
         preview_lines = [
-            "将使用单点方向/比例先验执行，尚不是三点精确标定。",
             f"共 {len(plan)} 片，Z 下压绝对坐标 {motion_config.z_down_mm:g} mm。",
             f"舵机方向系数 {motion_config.servo_direction:+g}。",
         ]
@@ -1025,15 +1092,16 @@ class RecognitionWindow(QMainWindow):
                 f"{index}. {step['id']}: GRBL ({source[0]:.1f}, {source[1]:.1f})"
                 f" → ({target[0]:.1f}, {target[1]:.1f})，舵机相对旋转 {step['servo_delta_deg']:+.1f}°"
             )
-        answer = QMessageBox.warning(
-            self,
-            "确认执行实际运动",
-            "\n".join(preview_lines),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            return
+        if not skip_confirmation:
+            answer = QMessageBox.question(
+                self,
+                "确认执行实际运动",
+                "\n".join(preview_lines),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
 
         self._execute_button.setEnabled(False)
         self._one_click_button.setEnabled(False)
@@ -1082,6 +1150,19 @@ class RecognitionWindow(QMainWindow):
             + "\n".join(timing_lines)
         )
         self._latest_solution = None
+        self._stop_one_click_elapsed("完成用时")
+        self._play_finished_sound()
+
+    def _play_finished_sound(self) -> None:
+        if (
+            not FINISHED_SOUND_PATH.is_file()
+            or self._finished_sound_process.state()
+            != QProcess.ProcessState.NotRunning
+        ):
+            return
+        self._finished_sound_process.start(
+            "/usr/bin/aplay", ["-q", str(FINISHED_SOUND_PATH)]
+        )
 
     @Slot(str)
     def _motion_failed(self, error: str) -> None:
@@ -1089,6 +1170,7 @@ class RecognitionWindow(QMainWindow):
         self._status.setText(f"{action}失败：{error}")
         self._details.setText("已尝试执行 Z 收回、磁铁释放、舵机复位和 XY 回零。请先检查机构状态。")
         self._latest_solution = None
+        self._stop_one_click_elapsed("结束用时")
 
     @Slot()
     def _motion_thread_finished(self) -> None:
@@ -1122,6 +1204,7 @@ class RecognitionWindow(QMainWindow):
         self._frozen = False
         self._latest_solution = None
         self._one_click_execute_pending = False
+        self._reset_one_click_elapsed()
         self._execute_button.setEnabled(False)
         self._details.clear()
         self._update_status()
@@ -1136,6 +1219,7 @@ class RecognitionWindow(QMainWindow):
             event.ignore()
             return
         self._timer.stop()
+        self._one_click_timer.stop()
         self._camera.release()
         super().closeEvent(event)
 
