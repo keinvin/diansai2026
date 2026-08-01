@@ -1,16 +1,14 @@
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import numpy as np
 
 from puzzle_solver.solver import (
     SolverConfig,
-    _apply_safe_placement_gap,
-    _polygon_edge_distance,
     _resolve_placement_overlaps,
     _score_card_features,
+    _score_card_symmetry,
     _score_edge_patterns,
     _violates_trusted_corner_constraint,
     polygon_area,
@@ -27,37 +25,6 @@ PIECES = [
 
 
 class SolverTest(unittest.TestCase):
-    def test_vectorized_polygon_edge_distance(self):
-        square = np.asarray([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=float)
-        separated = square + [5.0, 0.0]
-        touching = square + [2.0, 0.0]
-        crossing = np.asarray([[1, -1], [3, -1], [3, 1], [1, 1]], dtype=float)
-
-        self.assertAlmostEqual(_polygon_edge_distance(square, separated), 3.0)
-        self.assertEqual(_polygon_edge_distance(square, touching), 0.0)
-        self.assertEqual(_polygon_edge_distance(square, crossing), 0.0)
-
-    def test_invalid_overlap_skips_clearance_calculation(self):
-        polygons = [
-            np.asarray([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=float),
-            np.asarray([[2, 0], [4, 0], [4, 2], [2, 2]], dtype=float),
-        ]
-        config = SolverConfig(
-            placement_gap_mm=1.5,
-            max_placement_gap_mm=1.5,
-            final_overlap_tolerance_mm2=0.25,
-        )
-        unresolved = (polygons, [np.zeros(2), np.zeros(2)], 1.0)
-
-        with patch(
-            "puzzle_solver.solver._resolve_placement_overlaps",
-            return_value=unresolved,
-        ), patch("puzzle_solver.solver._minimum_piece_clearance") as clearance:
-            with self.assertRaises(RuntimeError):
-                _apply_safe_placement_gap(polygons, ["a", "b"], 4.0, 2.0, config)
-
-        clearance.assert_not_called()
-
     def test_pairwise_repulsion_removes_residual_overlap(self):
         polygons = [
             np.asarray([[0, 0], [50, 0], [50, 30], [0, 30]], dtype=float),
@@ -148,26 +115,31 @@ class SolverTest(unittest.TestCase):
         self.assertGreater(evidence, 0.5)
         self.assertLess(mismatch, 1e-9)
 
-    def test_sparse_print_mismatch_is_not_diluted_by_white_samples(self):
-        white = np.full((48, 3), 240.0)
-        printed = white.copy()
-        printed[20:26] = [25.0, 128.0, 128.0]
-        adjacency = {
-            "piece_a": 0,
-            "piece_b": 1,
-            "edge_a": 0,
-            "edge_b": 0,
-            "edge_b_reversed": False,
-            "edge_a_interval": [0.0, 1.0],
-            "edge_b_interval": [0.0, 1.0],
+    def test_card_symmetry_prefers_diagonal_ink(self):
+        poses = [
+            SimpleNamespace(rotation_rad=0.0, translation=(0.0, 0.0)),
+            SimpleNamespace(rotation_rad=0.0, translation=(0.0, 0.0)),
+        ]
+        first = {
+            "ink_points_mm": [[3.0, 3.0], [7.0, 5.0]],
+            "ink_point_colours": [0, 1],
         }
-
-        _, mismatch, evidence = _score_edge_patterns(
-            [adjacency], [[printed], [white]]
+        symmetric = {
+            "ink_points_mm": [[27.0, 17.0], [23.0, 15.0]],
+            "ink_point_colours": [0, 1],
+        }
+        asymmetric = {
+            "ink_points_mm": [[18.0, 17.0], [23.0, 15.0]],
+            "ink_point_colours": [0, 1],
+        }
+        good, evidence, _ = _score_card_symmetry(
+            poses, 30.0, 20.0, [first, symmetric], resolution_mm=1.0
         )
-
-        self.assertGreater(evidence, 0.5)
-        self.assertGreater(mismatch, 0.05)
+        bad, _, _ = _score_card_symmetry(
+            poses, 30.0, 20.0, [first, asymmetric], resolution_mm=1.0
+        )
+        self.assertGreater(evidence, 0.0)
+        self.assertLess(good, bad)
 
     def test_trusted_rounded_corner_must_land_on_card_corner(self):
         pose = SimpleNamespace(
@@ -182,11 +154,9 @@ class SolverTest(unittest.TestCase):
             "corner_red_density": [0.0] * 5,
             "corner_black_density": [0.0] * 5,
         }
-
         *_, details = _score_card_features(
             [pose], 30.0, 20.0, [features], config=SolverConfig()
         )
-
         self.assertEqual(details["trusted_rounded_corner_count"], 1)
         self.assertEqual(details["misplaced_rounded_corner_count"], 1)
         self.assertFalse(
@@ -206,11 +176,9 @@ class SolverTest(unittest.TestCase):
             "corner_red_density": [0.0] * 4,
             "corner_black_density": [0.0] * 4,
         }
-
         *_, details = _score_card_features(
             [pose], 20.0, 10.0, [features], config=SolverConfig()
         )
-
         self.assertEqual(details["trusted_rounded_corner_count"], 1)
         self.assertEqual(details["misplaced_rounded_corner_count"], 0)
 

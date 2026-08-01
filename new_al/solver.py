@@ -48,6 +48,10 @@ class SolverConfig:
     final_overlap_tolerance_mm2: float = 0.25
     pattern_score_weight: float = 0.65
     rounded_corner_score_weight: float = 0.20
+    min_trusted_corner_roundness_mm: float = 1.20
+    max_trusted_corner_distance_mm: float = 4.0
+    min_trusted_corner_right_angle_weight: float = 0.55
+    min_misplaced_trusted_corner_count: int = 2
     corner_mark_score_weight: float = 0.12
     card_symmetry_score_weight: float = 0.45
     min_card_symmetry_evidence: float = 0.70
@@ -816,11 +820,13 @@ def _score_card_features(
     width: float,
     height: float,
     piece_features: Sequence[dict] | None,
+    config: SolverConfig | None = None,
 ) -> tuple[float, float, float, float, dict]:
     """Score original card corners and diagonal rank/suit corner marks."""
 
     if piece_features is None:
         return 0.0, 0.0, 0.0, 0.0, {}
+    config = config or SolverConfig()
 
     rectangle_corners = np.asarray(
         [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]],
@@ -832,6 +838,7 @@ def _score_card_features(
     corner_red = np.zeros(4, dtype=float)
     corner_black = np.zeros(4, dtype=float)
     corner_roundness = np.zeros(4, dtype=float)
+    trusted_rounded_corners: list[dict] = []
 
     for pose, features in zip(poses, piece_features):
         roundness = np.asarray(features.get("corner_roundness_mm", []), dtype=float)
@@ -857,8 +864,9 @@ def _score_card_features(
             distances = np.linalg.norm(rectangle_corners - vertex, axis=1)
             target_corner = int(np.argmin(distances))
             distance = float(distances[target_corner])
+            roundness_mm = float(roundness[vertex_index])
             evidence = float(
-                np.clip((roundness[vertex_index] - 0.35) / 1.75, 0.0, 1.0)
+                np.clip((roundness_mm - 0.35) / 1.75, 0.0, 1.0)
                 * right_angle_weight
             )
             rounded_error += evidence * float(np.clip(distance / 8.0, 0.0, 1.0))
@@ -871,6 +879,25 @@ def _score_card_features(
                     corner_red[target_corner] = float(red[vertex_index])
                 if vertex_index < len(black):
                     corner_black[target_corner] = float(black[vertex_index])
+            if (
+                roundness_mm >= config.min_trusted_corner_roundness_mm
+                and right_angle_weight
+                >= config.min_trusted_corner_right_angle_weight
+            ):
+                trusted_rounded_corners.append(
+                    {
+                        "piece_index": pose.piece_index,
+                        "vertex_index": vertex_index,
+                        "roundness_mm": roundness_mm,
+                        "right_angle_weight": right_angle_weight,
+                        "previous_edge_length_mm": float(np.linalg.norm(previous)),
+                        "following_edge_length_mm": float(np.linalg.norm(following)),
+                        "nearest_rectangle_corner": target_corner,
+                        "distance_mm": distance,
+                        "misplaced": distance
+                        > config.max_trusted_corner_distance_mm,
+                    }
+                )
 
     rounded_mismatch = rounded_error / rounded_weight if rounded_weight > 1e-9 else 0.0
     rounded_evidence = float(np.clip(rounded_weight / 3.0, 0.0, 1.0))
@@ -883,14 +910,27 @@ def _score_card_features(
         * np.clip(corner_roundness.sum() / 2.0, 0.0, 1.0)
     )
     mark_mismatch = float(1.0 - np.clip(diagonal_contrast / 0.055, 0.0, 1.0))
+    misplaced_rounded_corners = [
+        item for item in trusted_rounded_corners if item["misplaced"]
+    ]
     details = {
         "corner_ink_density": corner_ink.tolist(),
         "corner_red_density": corner_red.tolist(),
         "corner_black_density": corner_black.tolist(),
         "corner_roundness_evidence": corner_roundness.tolist(),
         "diagonal_corner_mark_contrast": float(diagonal_contrast),
+        "trusted_rounded_corners": trusted_rounded_corners,
+        "trusted_rounded_corner_count": len(trusted_rounded_corners),
+        "misplaced_rounded_corner_count": len(misplaced_rounded_corners),
     }
     return rounded_mismatch, rounded_evidence, mark_mismatch, mark_evidence, details
+
+
+def _violates_trusted_corner_constraint(
+    details: dict, config: SolverConfig
+) -> bool:
+    minimum = int(config.min_misplaced_trusted_corner_count)
+    return minimum > 0 and details.get("misplaced_rounded_corner_count", 0) >= minimum
 
 
 def _score_card_symmetry(
@@ -1207,7 +1247,11 @@ def solve_puzzle(
             corner_mark_mismatch,
             corner_mark_evidence,
             card_feature_details,
-        ) = _score_card_features(poses, width, height, validated_features)
+        ) = _score_card_features(
+            poses, width, height, validated_features, config=config
+        )
+        if _violates_trusted_corner_constraint(card_feature_details, config):
+            continue
         ranked_score = (
             score
             + config.pattern_score_weight * pattern_mismatch * pattern_evidence
