@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import sysconfig
 from datetime import datetime
@@ -26,11 +27,13 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -52,6 +55,7 @@ from puzzle_solver.vision import (  # noqa: E402
 from main.config import load_config, save_config  # noqa: E402
 from main.pipeline import MainPipeline  # noqa: E402
 from main.timing import StageTimings  # noqa: E402
+from test.locate_red_a4 import locate_red_a4  # noqa: E402
 
 
 RED_A4_CORNERS_PATH = PROJECT_ROOT / "data" / "red_a4_corners.json"
@@ -103,11 +107,15 @@ class RecognitionWorker(QObject):
         frame: np.ndarray,
         config_document: dict,
         puzzle_search_enabled: bool,
+        transport_only: bool,
+        use_piece_features: bool,
     ) -> None:
         super().__init__()
         self._frame = frame
         self._config_document = config_document
         self._puzzle_search_enabled = puzzle_search_enabled
+        self._transport_only = transport_only
+        self._use_piece_features = use_piece_features
 
     @Slot()
     def run(self) -> None:
@@ -115,6 +123,8 @@ class RecognitionWorker(QObject):
             run = MainPipeline(self._config_document).recognize(
                 self._frame,
                 puzzle_search_enabled=self._puzzle_search_enabled,
+                transport_only=self._transport_only,
+                use_piece_features=self._use_piece_features,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -131,6 +141,7 @@ class RecognitionWorker(QObject):
                 "solve_error": run.solve_error,
                 "overlay": overlay,
                 "puzzle_search_enabled": run.puzzle_search_enabled,
+                "transport_only": run.transport_only,
                 "timings": run.timings,
             }
         )
@@ -282,6 +293,7 @@ class RecognitionWindow(QMainWindow):
         self._recognition_example_error: str | None = None
         self._motion_thread: QThread | None = None
         self._motion_worker: MotionWorker | None = None
+        self._task_mode: str | None = None
 
         self._camera = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not self._camera.isOpened():
@@ -303,7 +315,56 @@ class RecognitionWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
-        layout = QHBoxLayout(root)
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        self._pages = QStackedWidget()
+        root_layout.addWidget(self._pages)
+
+        menu = QWidget()
+        menu_layout = QVBoxLayout(menu)
+        menu_layout.setContentsMargins(56, 44, 56, 44)
+        menu_layout.setSpacing(22)
+        menu_title = QLabel("竞赛任务")
+        menu_title.setObjectName("menuTitle")
+        menu_title.setAlignment(Qt.AlignCenter)
+        menu_layout.addWidget(menu_title)
+        menu_hint = QLabel("选择题目后开始识别与执行")
+        menu_hint.setObjectName("menuHint")
+        menu_hint.setAlignment(Qt.AlignCenter)
+        menu_layout.addWidget(menu_hint)
+        task_grid = QGridLayout()
+        task_grid.setHorizontalSpacing(22)
+        task_grid.setVerticalSpacing(22)
+        task_buttons = (
+            ("第一题", "识别碎片后直接搬运到 A4 另一半", "transport"),
+            ("第二题", "识别白色碎片并搜索拼接方案", "white_puzzle"),
+            ("第三题", "识别扑克牌并搜索拼接方案", "card_puzzle"),
+            ("配置页面", "A4 定位、坐标校准与舵机校准", "configuration"),
+        )
+        for index, (title, hint, mode) in enumerate(task_buttons):
+            button = QPushButton(f"{title}\n{hint}")
+            button.setObjectName("taskButton")
+            button.setMinimumHeight(150)
+            button.clicked.connect(lambda _checked=False, value=mode: self._select_task(value))
+            task_grid.addWidget(button, index // 2, index % 2)
+        menu_layout.addLayout(task_grid, 1)
+        self._pages.addWidget(menu)
+
+        workspace = QWidget()
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(18, 14, 18, 18)
+        workspace_layout.setSpacing(12)
+        header = QHBoxLayout()
+        back_button = QPushButton("返回题目")
+        back_button.setObjectName("backButton")
+        back_button.clicked.connect(self._show_task_menu)
+        header.addWidget(back_button)
+        self._workspace_title = QLabel()
+        self._workspace_title.setObjectName("workspaceTitle")
+        header.addWidget(self._workspace_title, 1)
+        workspace_layout.addLayout(header)
+
+        layout = QHBoxLayout()
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(16)
 
@@ -318,9 +379,6 @@ class RecognitionWindow(QMainWindow):
         side_layout.setContentsMargins(18, 18, 18, 18)
         side_layout.setSpacing(12)
 
-        title = QLabel("拼图识别")
-        title.setObjectName("title")
-        side_layout.addWidget(title)
         self._status = QLabel()
         self._status.setWordWrap(True)
         self._status.setObjectName("status")
@@ -352,6 +410,7 @@ class RecognitionWindow(QMainWindow):
         self._puzzle_search_checkbox.toggled.connect(
             self._set_puzzle_search_enabled
         )
+        self._puzzle_search_checkbox.setVisible(False)
         side_layout.addWidget(self._puzzle_search_checkbox)
 
         self._capture_button = QPushButton("截图保存（用于标定）")
@@ -370,6 +429,10 @@ class RecognitionWindow(QMainWindow):
         self._red_a4_button.clicked.connect(self._load_red_a4_corners)
         side_layout.addWidget(self._red_a4_button)
 
+        self._locate_red_a4_button = QPushButton("从当前画面定位红色 A4")
+        self._locate_red_a4_button.clicked.connect(self._locate_red_a4_current_frame)
+        side_layout.addWidget(self._locate_red_a4_button)
+
         self._skip_button = QPushButton("跳过当前角（三点标定）")
         self._skip_button.clicked.connect(self._skip_corner)
         side_layout.addWidget(self._skip_button)
@@ -377,6 +440,18 @@ class RecognitionWindow(QMainWindow):
         self._clear_button = QPushButton("清除标定")
         self._clear_button.clicked.connect(self._clear_calibration)
         side_layout.addWidget(self._clear_button)
+
+        self._grbl_calibration_button = QPushButton("打开 A4 ↔ GRBL 校准")
+        self._grbl_calibration_button.clicked.connect(
+            lambda: self._launch_tool("viz/grbl_a4_calibration_app.py")
+        )
+        side_layout.addWidget(self._grbl_calibration_button)
+
+        self._servo_calibration_button = QPushButton("打开舵机校准")
+        self._servo_calibration_button.clicked.connect(
+            lambda: self._launch_tool("viz/servo_calibration_app.py")
+        )
+        side_layout.addWidget(self._servo_calibration_button)
 
         self._details = QLabel()
         self._details.setWordWrap(True)
@@ -389,15 +464,39 @@ class RecognitionWindow(QMainWindow):
         exit_button.clicked.connect(self.close)
         side_layout.addWidget(exit_button)
         layout.addWidget(side)
+        workspace_layout.addLayout(layout, 1)
+        self._pages.addWidget(workspace)
+
+        self._task_controls = [
+            self._recognize_button,
+            self._execute_button,
+            self._region_selector,
+            self._retake_button,
+        ]
+        self._configuration_controls = [
+            self._capture_button,
+            self._calibrate_button,
+            self._red_a4_button,
+            self._locate_red_a4_button,
+            self._skip_button,
+            self._clear_button,
+            self._grbl_calibration_button,
+            self._servo_calibration_button,
+        ]
 
         self.setStyleSheet(
             "QMainWindow { background: #171a20; color: #eef2f7; }"
             "#sidebar { background: #242933; border: 1px solid #394150; }"
-            "#title { font-size: 26px; font-weight: 700; color: #ffffff; }"
+            "#menuTitle { font-size: 38px; font-weight: 700; color: #ffffff; }"
+            "#menuHint { font-size: 19px; color: #b8c2d1; }"
+            "#workspaceTitle { font-size: 26px; font-weight: 700; color: #ffffff; }"
             "#status { font-size: 16px; color: #d3dae5; min-height: 70px; }"
             "#details { font-size: 15px; color: #b8c2d1; padding-top: 12px; }"
             "QPushButton { background: #2d6a9f; border: 0; padding: 13px 12px;"
             " color: white; font-size: 16px; }"
+            "#taskButton { background: #285b84; font-size: 22px; font-weight: 700; text-align: left; padding: 22px; }"
+            "#taskButton:pressed { background: #1e4d77; }"
+            "#backButton { background: #465465; font-size: 15px; }"
             "QPushButton:disabled { background: #4a505a; color: #c0c4cb; }"
             "QPushButton:pressed { background: #1e4d77; }"
             "QCheckBox { color: #d3dae5; font-size: 16px; padding: 6px 2px; }"
@@ -406,6 +505,40 @@ class RecognitionWindow(QMainWindow):
             "#exitButton { background: #9b3a3a; }"
             "#exitButton:pressed { background: #702727; }"
         )
+        self._show_task_menu()
+
+    def _show_task_menu(self) -> None:
+        if self._recognition_thread is not None or self._motion_thread is not None:
+            return
+        self._frozen = False
+        self._latest_solution = None
+        self._pages.setCurrentIndex(0)
+
+    def _select_task(self, mode: str) -> None:
+        if self._recognition_thread is not None or self._motion_thread is not None:
+            return
+        self._task_mode = mode
+        is_configuration = mode == "configuration"
+        for control in self._task_controls:
+            control.setVisible(not is_configuration)
+        for control in self._configuration_controls:
+            control.setVisible(is_configuration)
+        self._puzzle_search_checkbox.setVisible(False)
+        title_by_mode = {
+            "transport": "第一题：碎片搬运",
+            "white_puzzle": "第二题：白色碎片拼接",
+            "card_puzzle": "第三题：扑克牌拼接",
+            "configuration": "配置页面：标定与定位",
+        }
+        self._workspace_title.setText(title_by_mode[mode])
+        self._execute_button.setText(
+            "确认并执行搬运" if mode == "transport" else "确认并执行拼图"
+        )
+        self._latest_solution = None
+        self._execute_button.setEnabled(False)
+        self._details.clear()
+        self._frozen = False
+        self._pages.setCurrentIndex(1)
         self._update_status()
 
     def _read_frame(self) -> None:
@@ -495,6 +628,40 @@ class RecognitionWindow(QMainWindow):
         self._details.setText("已载入 red_a4_corners.json 的自动定位结果。")
         self._update_status()
 
+    def _locate_red_a4_current_frame(self) -> None:
+        """Run the existing red-paper locator against the live camera frame."""
+        if self._latest_frame is None:
+            self._status.setText("尚未收到摄像头画面，无法定位红色 A4")
+            return
+        try:
+            screen_corners, _mask = locate_red_a4(self._latest_frame)
+            a4_corners = screen_corners[list(A4_FROM_SCREEN)]
+        except Exception as error:
+            self._status.setText(f"红色 A4 自动定位失败：{error}")
+            return
+        self._corners = [QPointF(*point) for point in screen_corners]
+        self._document["screen_a4_corners_px"] = np.round(screen_corners, 2).tolist()
+        self._document["a4_corners_px"] = np.round(a4_corners, 2).tolist()
+        self._document["a4_corner_indices"] = [0, 1, 2, 3]
+        self._save_document_fields(
+            "screen_a4_corners_px", "a4_corners_px", "a4_corner_indices"
+        )
+        self._frozen = False
+        self._details.setText("已从当前画面定位并保存红色 A4 的四个角。")
+        self._update_status()
+
+    def _launch_tool(self, relative_path: str) -> None:
+        path = PROJECT_ROOT / relative_path
+        if not path.is_file():
+            self._status.setText(f"找不到校准工具：{relative_path}")
+            return
+        try:
+            subprocess.Popen([sys.executable, str(path)], cwd=PROJECT_ROOT)
+        except OSError as error:
+            self._status.setText(f"无法启动校准工具：{error}")
+            return
+        self._status.setText(f"已打开 {path.stem}，关闭该窗口后可继续这里的操作。")
+
     def _add_corner(self, point: QPointF) -> None:
         if self._frozen or len(self._corners) >= 4:
             return
@@ -524,6 +691,15 @@ class RecognitionWindow(QMainWindow):
 
     def _update_status(self) -> None:
         complete = len(self._corners) == 4 and sum(point is not None for point in self._corners) >= 3
+        if self._task_mode == "configuration":
+            if complete:
+                self._status.setText("A4 标定已完成；可重新点选四角，或使用红色 A4 自动定位。")
+            else:
+                index = len(self._corners)
+                self._status.setText(f"请点选 {SCREEN_CORNER_NAMES[index]}（{index}/4）")
+            if self._latest_frame is not None:
+                self._view.set_image(self._latest_frame, self._corners)
+            return
         if not complete:
             index = len(self._corners)
             self._status.setText(
@@ -532,7 +708,12 @@ class RecognitionWindow(QMainWindow):
             self._recognize_button.setEnabled(False)
         else:
             region_name = "上半" if self._document.get("a4_region", "upper") == "upper" else "下半"
-            self._status.setText(f"A4 标定完成，可以识别当前画面（当前：{region_name}）")
+            task_hint = {
+                "transport": "可以识别碎片并搬运到另一半 A4",
+                "white_puzzle": "可以识别白色碎片并搜索拼接方案",
+                "card_puzzle": "可以识别扑克牌并搜索拼接方案",
+            }.get(self._task_mode, "可以识别当前画面")
+            self._status.setText(f"A4 标定完成，{task_hint}（当前：{region_name}）")
             self._recognize_button.setEnabled(True)
         if self._latest_frame is not None:
             self._view.set_image(self._latest_frame, self._corners)
@@ -560,18 +741,20 @@ class RecognitionWindow(QMainWindow):
         self._recognize_button.setEnabled(False)
         self._region_selector.setEnabled(False)
         self._puzzle_search_checkbox.setEnabled(False)
-        puzzle_search_enabled = bool(
-            self._document.get("puzzle_search_enabled", True)
-        )
-        if puzzle_search_enabled:
-            self._status.setText("正在识别碎片并搜索拼接方案……")
+        transport_only = self._task_mode == "transport"
+        puzzle_search_enabled = not transport_only
+        use_piece_features = self._task_mode == "card_puzzle"
+        if transport_only:
+            self._status.setText("正在识别碎片并生成搬运位置……")
         else:
-            self._status.setText("正在识别碎片（拼图搜索已关闭）……")
+            self._status.setText("正在识别碎片并搜索拼接方案……")
         thread = QThread(self)
         worker = RecognitionWorker(
             frame,
             self._document,
             puzzle_search_enabled,
+            transport_only,
+            use_piece_features,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -593,14 +776,19 @@ class RecognitionWindow(QMainWindow):
         solution = payload["solution"]
         solve_error = payload["solve_error"]
         puzzle_search_enabled = bool(payload["puzzle_search_enabled"])
+        transport_only = bool(payload["transport_only"])
         self._latest_timings = dict(payload["timings"])
         self._frozen = True
-        self._latest_solution = solution if puzzle_search_enabled else None
-        self._execute_button.setEnabled(
-            puzzle_search_enabled and solution is not None
-        )
+        self._latest_solution = solution
+        self._execute_button.setEnabled(solution is not None)
         self._view.set_image(payload["overlay"], [])
-        if not puzzle_search_enabled:
+        if transport_only and solution is None:
+            self._status.setText(f"识别到 {len(result.pieces)} 块碎片，但无法生成搬运位置")
+        elif transport_only:
+            self._status.setText(
+                f"识别到 {len(result.pieces)} 块碎片，已生成另一半 A4 的搬运位置"
+            )
+        elif not puzzle_search_enabled:
             self._status.setText(
                 f"识别到 {len(result.pieces)} 块拼图（拼图搜索已关闭）"
             )
@@ -625,7 +813,9 @@ class RecognitionWindow(QMainWindow):
             detail_lines.append(
                 f"识别原图保存失败：{self._recognition_example_error}"
             )
-        if not puzzle_search_enabled:
+        if transport_only and solution is not None:
+            detail_lines.append("第一题：不做拼接；自动使用 0°/90° 放置，将碎片依次搬运到 A4 另一半。")
+        elif not puzzle_search_enabled:
             detail_lines.append("拼图搜索已关闭：仅显示碎片轮廓和顶点。")
         elif solution is not None:
             pattern_evidence = solution["metrics"]["pattern_evidence"]
@@ -663,7 +853,7 @@ class RecognitionWindow(QMainWindow):
             if self._recognition_example_error
             else ""
         )
-        self._status.setText(f"识别失败：{error}{suffix}")
+        self._status.setText(f"识别或规划失败：{error}{suffix}")
         self._details.clear()
         self._frozen = False
 
@@ -742,7 +932,8 @@ class RecognitionWindow(QMainWindow):
     def _motion_completed(self, payload: dict) -> None:
         plan = payload["plan"]
         self._latest_timings = dict(payload["timings"])
-        self._status.setText(f"拼图执行完成，共放置 {len(plan)} 片，机械机构已回到工作零点。")
+        action = "搬运" if self._task_mode == "transport" else "拼图"
+        self._status.setText(f"{action}执行完成，共放置 {len(plan)} 片，机械机构已回到工作零点。")
         timing_lines = StageTimings.from_dict(
             self._latest_timings,
             enabled=self._pipeline.timing_enabled,
@@ -755,7 +946,8 @@ class RecognitionWindow(QMainWindow):
 
     @Slot(str)
     def _motion_failed(self, error: str) -> None:
-        self._status.setText(f"拼图动作失败：{error}")
+        action = "搬运动作" if self._task_mode == "transport" else "拼图动作"
+        self._status.setText(f"{action}失败：{error}")
         self._details.setText("已尝试执行 Z 收回、磁铁释放、舵机复位和 XY 回零。请先检查机构状态。")
         self._latest_solution = None
 

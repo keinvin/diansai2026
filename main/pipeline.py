@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import itertools
+import math
 from dataclasses import dataclass, fields
 from typing import Callable, Sequence
 
@@ -36,6 +38,7 @@ class RecognitionRun:
     calibration: Calibration
     timings: dict[str, float]
     puzzle_search_enabled: bool
+    transport_only: bool
 
 
 @dataclass
@@ -85,6 +88,159 @@ def place_solution_in_opposite_half(
     return solution
 
 
+def build_transport_solution(
+    pieces: Sequence[object],
+    source_region: str,
+    a4_width: float,
+    a4_height: float,
+    *,
+    gap_mm: float = 8.0,
+) -> dict:
+    """Pack detected pieces into the other A4 half without puzzle solving.
+
+    The first-question workflow intentionally does not infer an assembly.  It
+    first preserves every piece's direction, then also tries 90-degree turns
+    when necessary to make the detected pieces fit into the available half.
+    """
+
+    if not pieces:
+        raise RuntimeError("没有可搬运的碎片")
+    half_height = a4_height / 2.0
+    target_y0 = half_height if source_region == "upper" else 0.0
+    ordered = sorted(pieces, key=lambda piece: (piece.centroid_mm[1], piece.centroid_mm[0]))
+
+    def pack(
+        candidate_gap_mm: float,
+        placements: Sequence[tuple[object, float]],
+    ) -> list[dict] | None:
+        cursor_x = candidate_gap_mm
+        cursor_y = target_y0 + candidate_gap_mm
+        row_height = 0.0
+        placed: list[dict] = []
+        for piece, rotation_deg in placements:
+            polygon = np.asarray(piece.polygon_mm, dtype=float)
+            rotation = (
+                np.asarray([[1.0, 0.0], [0.0, 1.0]])
+                if rotation_deg == 0.0
+                else np.asarray([[0.0, -1.0], [1.0, 0.0]])
+            )
+            rotated_polygon = polygon @ rotation.T
+            minimum = rotated_polygon.min(axis=0)
+            maximum = rotated_polygon.max(axis=0)
+            width, height = maximum - minimum
+            if (
+                width + 2.0 * candidate_gap_mm > a4_width
+                or height + 2.0 * candidate_gap_mm > half_height
+            ):
+                return None
+            if cursor_x + width + candidate_gap_mm > a4_width:
+                cursor_x = candidate_gap_mm
+                cursor_y += row_height + candidate_gap_mm
+                row_height = 0.0
+            if cursor_y + height + candidate_gap_mm > target_y0 + half_height:
+                return None
+            translation = np.asarray([cursor_x, cursor_y], dtype=float) - minimum
+            pickup_source = np.asarray(piece.pickup_point_mm, dtype=float)
+            placed.append(
+                {
+                    "id": piece.id,
+                    "rotation_deg": rotation_deg,
+                    "rotation_matrix": rotation.tolist(),
+                    "translation_mm": translation.tolist(),
+                    "target_polygon_mm": (rotated_polygon + translation).tolist(),
+                    "pickup_source_mm": pickup_source.tolist(),
+                    "pickup_target_mm": (rotation @ pickup_source + translation).tolist(),
+                }
+            )
+            cursor_x += width + candidate_gap_mm
+            row_height = max(row_height, float(height))
+        return placed
+
+    placed: list[dict] | None = None
+    applied_gap_mm = gap_mm
+    # At most four pieces are detected, so 4! * 2^4 layouts remain cheap.
+    # Keep the largest safe gap that fits, then choose the most compact
+    # rectangle instead of accepting the first arbitrary shelf placement.
+    target_aspect = a4_width / half_height
+    for candidate_gap_mm in dict.fromkeys((gap_mm, 6.0, 4.0, 2.0, 1.0, 0.5)):
+        best_layout: list[dict] | None = None
+        best_score: tuple[float, float, int, tuple[str, ...]] | None = None
+        for order in itertools.permutations(ordered):
+            for rotations in itertools.product((0.0, 90.0), repeat=len(order)):
+                candidate = pack(
+                    float(candidate_gap_mm), tuple(zip(order, rotations))
+                )
+                if candidate is None:
+                    continue
+                points = np.vstack(
+                    [np.asarray(piece["target_polygon_mm"], dtype=float) for piece in candidate]
+                )
+                size = points.max(axis=0) - points.min(axis=0)
+                rectangle_area = float(size[0] * size[1])
+                aspect_error = abs(
+                    math.log(max(float(size[0]), 1e-6) / max(float(size[1]), 1e-6) / target_aspect)
+                )
+                score = (
+                    rectangle_area,
+                    aspect_error,
+                    sum(rotation != 0.0 for rotation in rotations),
+                    tuple(str(piece.id) for piece in order),
+                )
+                if best_score is None or score < best_score:
+                    best_layout = candidate
+                    best_score = score
+        if best_layout is not None:
+            placed = best_layout
+            applied_gap_mm = float(candidate_gap_mm)
+            break
+    if placed is None:
+        raise RuntimeError("碎片无法无重叠地放入另一半 A4")
+
+    all_points = np.vstack(
+        [np.asarray(piece["target_polygon_mm"], dtype=float) for piece in placed]
+    )
+    lower = all_points.min(axis=0)
+    upper = all_points.max(axis=0)
+    size = upper - lower
+    centering_offset = np.asarray(
+        [
+            (a4_width - size[0]) / 2.0 - lower[0],
+            target_y0 + (half_height - size[1]) / 2.0 - lower[1],
+        ],
+        dtype=float,
+    )
+    for piece in placed:
+        piece["translation_mm"] = (
+            np.asarray(piece["translation_mm"], dtype=float) + centering_offset
+        ).tolist()
+        piece["target_polygon_mm"] = (
+            np.asarray(piece["target_polygon_mm"], dtype=float) + centering_offset
+        ).tolist()
+        piece["pickup_target_mm"] = (
+            np.asarray(piece["pickup_target_mm"], dtype=float) + centering_offset
+        ).tolist()
+    lower += centering_offset
+    return {
+        "pieces": placed,
+        "rectangle": {
+            "origin_mm": lower.tolist(),
+            "width_mm": float(size[0]),
+            "height_mm": float(size[1]),
+        },
+        "metrics": {
+            "pattern_evidence": 0.0,
+            "pattern_mismatch": 0.0,
+            "hole_ratio": 0.0,
+            "overlap_ratio": 0.0,
+            "applied_placement_gap_mm": applied_gap_mm,
+            "final_overlap_area_mm2": 0.0,
+            "max_adjacent_vertex_distance_mm": 0.0,
+        },
+        "config": {"min_pattern_evidence": 1.0},
+        "workflow": "transport",
+    }
+
+
 class MainPipeline:
     """Own the non-UI flow and its standalone configuration."""
 
@@ -122,6 +278,8 @@ class MainPipeline:
         frame: np.ndarray,
         *,
         puzzle_search_enabled: bool | None = None,
+        transport_only: bool = False,
+        use_piece_features: bool = True,
         initial_timings: dict[str, float] | None = None,
     ) -> RecognitionRun:
         timings = StageTimings.from_dict(
@@ -146,14 +304,30 @@ class MainPipeline:
             if puzzle_search_enabled is None
             else bool(puzzle_search_enabled)
         )
+        enabled = enabled and not transport_only
         solution = None
         solve_error = None
-        if enabled:
+        if transport_only:
+            with timings.measure("solve"):
+                try:
+                    solution = build_transport_solution(
+                        result.pieces,
+                        self.document.get("a4_region", "upper"),
+                        float(self.document["a4_width_mm"]),
+                        float(self.document["a4_height_mm"]),
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    solve_error = str(exc)
+        elif enabled:
             with timings.measure("solve"):
                 try:
                     edge_profiles = extract_edge_profiles(corrected_frame, result.pieces)
-                    piece_features = extract_piece_features(
-                        corrected_frame, result.pieces, calibration
+                    piece_features = (
+                        extract_piece_features(
+                            corrected_frame, result.pieces, calibration
+                        )
+                        if use_piece_features
+                        else None
                     )
                     solution = solve_puzzle(
                         [piece.polygon_mm for piece in result.pieces],
@@ -196,6 +370,7 @@ class MainPipeline:
             calibration=calibration,
             timings=timings.to_dict(),
             puzzle_search_enabled=enabled,
+            transport_only=bool(transport_only),
         )
         self._log_timings(
             "recognition_completed",
@@ -203,6 +378,8 @@ class MainPipeline:
             a4_region=self.document.get("a4_region", "upper"),
             piece_count=len(result.pieces),
             puzzle_search_enabled=enabled,
+            transport_only=bool(transport_only),
+            use_piece_features=bool(use_piece_features),
             solution_found=solution is not None,
             solve_error=solve_error,
         )
