@@ -980,69 +980,75 @@ def _assembly_is_connected(piece_count: int, adjacencies: Sequence[dict]) -> boo
     return len(visited) == piece_count
 
 
-def _point_to_segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
-    edge = end - start
-    length_squared = float(np.dot(edge, edge))
-    if length_squared <= 1e-12:
-        return float(np.linalg.norm(point - start))
-    fraction = float(np.clip(np.dot(point - start, edge) / length_squared, 0.0, 1.0))
-    return float(np.linalg.norm(point - (start + fraction * edge)))
-
-
-def _segments_intersect(
-    first_start: np.ndarray,
-    first_end: np.ndarray,
-    second_start: np.ndarray,
-    second_end: np.ndarray,
-) -> bool:
-    """Return whether two closed line segments touch or cross."""
-
-    def cross(origin: np.ndarray, first: np.ndarray, second: np.ndarray) -> float:
-        first_delta = first - origin
-        second_delta = second - origin
-        return float(
-            first_delta[0] * second_delta[1]
-            - first_delta[1] * second_delta[0]
-        )
-
-    def on_segment(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> bool:
-        return (
-            min(start[0], end[0]) - 1e-9 <= point[0] <= max(start[0], end[0]) + 1e-9
-            and min(start[1], end[1]) - 1e-9 <= point[1] <= max(start[1], end[1]) + 1e-9
-        )
-
-    first_a = cross(first_start, first_end, second_start)
-    first_b = cross(first_start, first_end, second_end)
-    second_a = cross(second_start, second_end, first_start)
-    second_b = cross(second_start, second_end, first_end)
-    if first_a * first_b < 0.0 and second_a * second_b < 0.0:
-        return True
-    return (
-        (abs(first_a) <= 1e-9 and on_segment(second_start, first_start, first_end))
-        or (abs(first_b) <= 1e-9 and on_segment(second_end, first_start, first_end))
-        or (abs(second_a) <= 1e-9 and on_segment(first_start, second_start, second_end))
-        or (abs(second_b) <= 1e-9 and on_segment(first_end, second_start, second_end))
-    )
-
-
 def _polygon_edge_distance(first: np.ndarray, second: np.ndarray) -> float:
     """Return the shortest physical distance between two simple polygon edges."""
 
-    minimum = math.inf
-    for first_index, first_start in enumerate(first):
-        first_end = first[(first_index + 1) % len(first)]
-        for second_index, second_start in enumerate(second):
-            second_end = second[(second_index + 1) % len(second)]
-            if _segments_intersect(first_start, first_end, second_start, second_end):
-                return 0.0
-            minimum = min(
-                minimum,
-                _point_to_segment_distance(first_start, second_start, second_end),
-                _point_to_segment_distance(first_end, second_start, second_end),
-                _point_to_segment_distance(second_start, first_start, first_end),
-                _point_to_segment_distance(second_end, first_start, first_end),
-            )
-    return minimum
+    first = np.asarray(first, dtype=float)
+    second = np.asarray(second, dtype=float)
+    first_start = first[:, None, :]
+    first_end = np.roll(first, -1, axis=0)[:, None, :]
+    second_start = second[None, :, :]
+    second_end = np.roll(second, -1, axis=0)[None, :, :]
+    first_delta = first_end - first_start
+    second_delta = second_end - second_start
+
+    def cross(first_vector: np.ndarray, second_vector: np.ndarray) -> np.ndarray:
+        return (
+            first_vector[..., 0] * second_vector[..., 1]
+            - first_vector[..., 1] * second_vector[..., 0]
+        )
+
+    first_a = cross(first_delta, second_start - first_start)
+    first_b = cross(first_delta, second_end - first_start)
+    second_a = cross(second_delta, first_start - second_start)
+    second_b = cross(second_delta, first_end - second_start)
+    epsilon = 1e-9
+
+    def on_segment(
+        point: np.ndarray, start: np.ndarray, end: np.ndarray
+    ) -> np.ndarray:
+        return (
+            (np.minimum(start[..., 0], end[..., 0]) - epsilon <= point[..., 0])
+            & (point[..., 0] <= np.maximum(start[..., 0], end[..., 0]) + epsilon)
+            & (np.minimum(start[..., 1], end[..., 1]) - epsilon <= point[..., 1])
+            & (point[..., 1] <= np.maximum(start[..., 1], end[..., 1]) + epsilon)
+        )
+
+    intersects = (
+        ((first_a * first_b < 0.0) & (second_a * second_b < 0.0))
+        | ((np.abs(first_a) <= epsilon) & on_segment(second_start, first_start, first_end))
+        | ((np.abs(first_b) <= epsilon) & on_segment(second_end, first_start, first_end))
+        | ((np.abs(second_a) <= epsilon) & on_segment(first_start, second_start, second_end))
+        | ((np.abs(second_b) <= epsilon) & on_segment(first_end, second_start, second_end))
+    )
+    if np.any(intersects):
+        return 0.0
+
+    def point_to_segments(
+        point: np.ndarray, start: np.ndarray, end: np.ndarray
+    ) -> np.ndarray:
+        edge = end - start
+        length_squared = np.sum(edge * edge, axis=-1)
+        numerator = np.sum((point - start) * edge, axis=-1)
+        fraction = np.zeros_like(numerator)
+        np.divide(
+            numerator,
+            length_squared,
+            out=fraction,
+            where=length_squared > 1e-12,
+        )
+        fraction = np.clip(fraction, 0.0, 1.0)
+        projected = start + fraction[..., None] * edge
+        return np.linalg.norm(point - projected, axis=-1)
+
+    return float(
+        min(
+            np.min(point_to_segments(first_start, second_start, second_end)),
+            np.min(point_to_segments(first_end, second_start, second_end)),
+            np.min(point_to_segments(second_start, first_start, first_end)),
+            np.min(point_to_segments(second_end, first_start, first_end)),
+        )
+    )
 
 
 def _minimum_piece_clearance(polygons: Sequence[np.ndarray]) -> float:
@@ -1077,18 +1083,17 @@ def _apply_safe_placement_gap(
             maximum_gap,
             config.final_overlap_tolerance_mm2,
         )
+        if overlap_area > config.final_overlap_tolerance_mm2:
+            continue
         checked_adjacencies = _adjacency_vertex_distances(placed, adjacencies)
         vertices_valid = all(
             adjacency["max_corresponding_vertex_distance_mm"]
             <= config.max_adjacent_vertex_distance_mm
             for adjacency in checked_adjacencies
         )
-        clearance_valid = _minimum_piece_clearance(placed) + 1e-6 >= requested_gap
-        if (
-            overlap_area <= config.final_overlap_tolerance_mm2
-            and vertices_valid
-            and clearance_valid
-        ):
+        if not vertices_valid:
+            continue
+        if _minimum_piece_clearance(placed) + 1e-6 >= requested_gap:
             return placed, offsets, checked_adjacencies, float(gap), overlap_area
 
     raise RuntimeError(

@@ -1,10 +1,13 @@
 import math
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from puzzle_solver.solver import (
     SolverConfig,
+    _apply_safe_placement_gap,
+    _polygon_edge_distance,
     _resolve_placement_overlaps,
     _score_edge_patterns,
     polygon_area,
@@ -21,6 +24,37 @@ PIECES = [
 
 
 class SolverTest(unittest.TestCase):
+    def test_vectorized_polygon_edge_distance(self):
+        square = np.asarray([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=float)
+        separated = square + [5.0, 0.0]
+        touching = square + [2.0, 0.0]
+        crossing = np.asarray([[1, -1], [3, -1], [3, 1], [1, 1]], dtype=float)
+
+        self.assertAlmostEqual(_polygon_edge_distance(square, separated), 3.0)
+        self.assertEqual(_polygon_edge_distance(square, touching), 0.0)
+        self.assertEqual(_polygon_edge_distance(square, crossing), 0.0)
+
+    def test_invalid_overlap_skips_clearance_calculation(self):
+        polygons = [
+            np.asarray([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=float),
+            np.asarray([[2, 0], [4, 0], [4, 2], [2, 2]], dtype=float),
+        ]
+        config = SolverConfig(
+            placement_gap_mm=1.5,
+            max_placement_gap_mm=1.5,
+            final_overlap_tolerance_mm2=0.25,
+        )
+        unresolved = (polygons, [np.zeros(2), np.zeros(2)], 1.0)
+
+        with patch(
+            "puzzle_solver.solver._resolve_placement_overlaps",
+            return_value=unresolved,
+        ), patch("puzzle_solver.solver._minimum_piece_clearance") as clearance:
+            with self.assertRaises(RuntimeError):
+                _apply_safe_placement_gap(polygons, ["a", "b"], 4.0, 2.0, config)
+
+        clearance.assert_not_called()
+
     def test_pairwise_repulsion_removes_residual_overlap(self):
         polygons = [
             np.asarray([[0, 0], [50, 0], [50, 30], [0, 30]], dtype=float),
