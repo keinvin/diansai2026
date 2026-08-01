@@ -1280,7 +1280,7 @@ class RecognitionWindow(QMainWindow):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Puzzle-piece recognition touchscreen UI")
-    parser.add_argument("--device", default="/dev/video41", help="V4L2 camera device")
+    parser.add_argument("--device", default="/dev/diansai-camera", help="V4L2 camera device")
     parser.add_argument("--fullscreen", action="store_true", help="Start in fullscreen mode")
     args = parser.parse_args()
 

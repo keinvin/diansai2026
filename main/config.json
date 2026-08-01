@@ -121,12 +121,12 @@
     "servo_soft_limit_deg": 360.0
   },
   "hardware": {
-    "grbl_port": "/dev/ttyUSB1",
+    "grbl_port": "/dev/diansai-grbl",
     "grbl_baudrate": 115200,
     "grbl_step_idle_delay_ms": 255,
     "grbl_set_work_origin_on_init": true,
     "grbl_release_on_close": true,
-    "servo_port": "/dev/ttyUSB0",
+    "servo_port": "/dev/diansai-servo",
     "servo_baudrate": 115200,
     "servo_id": 1,
     "mag_chip": "gpiochip1",

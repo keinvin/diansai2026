@@ -407,7 +407,7 @@ class MainPipeline:
         hardware = self.document.get("hardware", {})
         try:
             with MotionExecutor(
-                grbl_port=str(hardware.get("grbl_port", "/dev/ttyUSB0")),
+                grbl_port=str(hardware.get("grbl_port", "/dev/diansai-grbl")),
                 grbl_baudrate=int(hardware.get("grbl_baudrate", 115200)),
                 grbl_step_idle_delay_ms=int(
                     hardware.get("grbl_step_idle_delay_ms", 255)
@@ -418,7 +418,7 @@ class MainPipeline:
                 grbl_release_on_close=bool(
                     hardware.get("grbl_release_on_close", True)
                 ),
-                servo_port=str(hardware.get("servo_port", "/dev/ttyUSB1")),
+                servo_port=str(hardware.get("servo_port", "/dev/diansai-servo")),
                 servo_baudrate=int(hardware.get("servo_baudrate", 115200)),
                 servo_id=int(hardware.get("servo_id", 1)),
                 mag_chip=str(hardware.get("mag_chip", "gpiochip1")),

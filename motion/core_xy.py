@@ -15,7 +15,7 @@ from typing import Iterable
 import serial
 
 
-DEFAULT_PORT = "/dev/ttyUSB1"
+DEFAULT_PORT = "/dev/diansai-grbl"
 DEFAULT_BAUDRATE = 115200
 
 
