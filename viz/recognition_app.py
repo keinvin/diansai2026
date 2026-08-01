@@ -290,7 +290,7 @@ class CameraView(QWidget):
         self._image: QImage | None = None
         self._target_rect = QRectF()
         self._corners: list[QPointF] = []
-        self.setMinimumSize(900, 540)
+        self.setMinimumSize(640, 360)
         self.setCursor(Qt.CrossCursor)
 
     def set_image(self, frame: np.ndarray, corners: list[QPointF | None]) -> None:
@@ -445,6 +445,20 @@ class RecognitionWindow(QMainWindow):
         workspace_layout = QVBoxLayout(workspace)
         workspace_layout.setContentsMargins(18, 14, 18, 18)
         workspace_layout.setSpacing(12)
+
+        self._status = QLabel()
+        self._status.setWordWrap(True)
+        self._status.setObjectName("status")
+        self._status.setMaximumHeight(58)
+
+        self._one_click_elapsed = QLabel("运行计时 0 s")
+        self._one_click_elapsed.setObjectName("runTimer")
+        self._one_click_elapsed.setAlignment(Qt.AlignCenter)
+        self._one_click_elapsed.setVisible(False)
+        self._one_click_timer = QTimer(self)
+        self._one_click_timer.setInterval(1000)
+        self._one_click_timer.timeout.connect(self._update_one_click_elapsed)
+
         header = QHBoxLayout()
         back_button = QPushButton("返回题目")
         back_button.setObjectName("backButton")
@@ -453,6 +467,8 @@ class RecognitionWindow(QMainWindow):
         self._workspace_title = QLabel()
         self._workspace_title.setObjectName("workspaceTitle")
         header.addWidget(self._workspace_title, 1)
+        header.addWidget(self._status, 2)
+        header.addWidget(self._one_click_elapsed)
         exit_button = QPushButton("退出")
         exit_button.setObjectName("exitButton")
         exit_button.clicked.connect(self.close)
@@ -470,38 +486,32 @@ class RecognitionWindow(QMainWindow):
         side = QFrame()
         side.setObjectName("sidebar")
         side.setFixedWidth(360)
+        self._configuration_sidebar = side
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(18, 18, 18, 18)
         side_layout.setSpacing(12)
 
-        self._status = QLabel()
-        self._status.setWordWrap(True)
-        self._status.setObjectName("status")
-        side_layout.addWidget(self._status)
-
-        self._one_click_elapsed = QLabel("运行计时 0 s")
-        self._one_click_elapsed.setObjectName("runTimer")
-        self._one_click_elapsed.setAlignment(Qt.AlignCenter)
-        self._one_click_elapsed.setVisible(False)
-        side_layout.addWidget(self._one_click_elapsed)
-        self._one_click_timer = QTimer(self)
-        self._one_click_timer.setInterval(1000)
-        self._one_click_timer.timeout.connect(self._update_one_click_elapsed)
+        self._task_action_panel = QFrame()
+        self._task_action_panel.setObjectName("taskActionPanel")
+        task_action_layout = QHBoxLayout(self._task_action_panel)
+        task_action_layout.setContentsMargins(0, 0, 0, 0)
+        task_action_layout.setSpacing(14)
 
         self._one_click_button = QPushButton("一键启动")
         self._one_click_button.setObjectName("oneClickButton")
         self._one_click_button.clicked.connect(self._one_click_start)
-        side_layout.addWidget(self._one_click_button)
+        task_action_layout.addWidget(self._one_click_button, 4)
 
         self._recognize_button = QPushButton("仅识别并生成方案")
+        self._recognize_button.setObjectName("taskActionButton")
         self._recognize_button.clicked.connect(self._recognize_manually)
-        side_layout.addWidget(self._recognize_button)
+        task_action_layout.addWidget(self._recognize_button, 3)
 
         self._execute_button = QPushButton("确认并执行拼图")
         self._execute_button.setObjectName("executeButton")
         self._execute_button.setEnabled(False)
         self._execute_button.clicked.connect(self._execute_solution)
-        side_layout.addWidget(self._execute_button)
+        task_action_layout.addWidget(self._execute_button, 3)
 
         self._region_selector = QComboBox()
         self._region_selector.addItem("识别 A4 上半", "upper")
@@ -510,7 +520,7 @@ class RecognitionWindow(QMainWindow):
         index = self._region_selector.findData(saved_region)
         self._region_selector.setCurrentIndex(index if index >= 0 else 0)
         self._region_selector.currentIndexChanged.connect(self._set_a4_region)
-        side_layout.addWidget(self._region_selector)
+        task_action_layout.addWidget(self._region_selector, 2)
 
         self._puzzle_search_checkbox = QCheckBox("启用拼图搜索")
         self._puzzle_search_checkbox.setChecked(
@@ -527,8 +537,9 @@ class RecognitionWindow(QMainWindow):
         side_layout.addWidget(self._capture_button)
 
         self._retake_button = QPushButton("继续预览")
+        self._retake_button.setObjectName("taskActionButton")
         self._retake_button.clicked.connect(self._resume)
-        side_layout.addWidget(self._retake_button)
+        task_action_layout.addWidget(self._retake_button, 2)
 
         self._calibrate_button = QPushButton("重新标定 A4")
         self._calibrate_button.clicked.connect(self._start_calibration)
@@ -587,9 +598,11 @@ class RecognitionWindow(QMainWindow):
         side_layout.addStretch(1)
         layout.addWidget(side)
         workspace_layout.addLayout(layout, 1)
+        workspace_layout.addWidget(self._task_action_panel)
         self._pages.addWidget(workspace)
 
         self._task_controls = [
+            self._task_action_panel,
             self._one_click_button,
             self._recognize_button,
             self._execute_button,
@@ -620,7 +633,7 @@ class RecognitionWindow(QMainWindow):
             "#menuTitle { font-size: 50px; font-weight: 700; color: #ffffff; }"
             "#menuHint { font-size: 24px; color: #b8c2d1; }"
             "#workspaceTitle { font-size: 34px; font-weight: 700; color: #ffffff; }"
-            "#status { font-size: 20px; color: #d3dae5; min-height: 76px; }"
+            "#status { font-size: 18px; color: #d3dae5; padding: 4px 10px; }"
             "#runTimer { background: #0f6b48; border: 2px solid #41d39a;"
             " color: #ffffff; font-size: 34px; font-weight: 700; padding: 14px 8px; }"
             "#details { font-size: 17px; color: #b8c2d1; padding-top: 12px; }"
@@ -633,9 +646,12 @@ class RecognitionWindow(QMainWindow):
             "QPushButton:pressed { background: #1e4d77; }"
             "QComboBox { font-size: 20px; padding: 8px; }"
             "QCheckBox { color: #d3dae5; font-size: 20px; padding: 6px 2px; }"
-            "#oneClickButton { background: #16734a; font-size: 24px; font-weight: 700; padding: 18px 12px; }"
+            "#taskActionPanel { background: transparent; }"
+            "#oneClickButton { background: #16734a; font-size: 27px; font-weight: 700; min-height: 82px; padding: 18px 12px; }"
             "#oneClickButton:pressed { background: #0e5235; }"
-            "#executeButton { background: #a66616; font-weight: 700; }"
+            "#taskActionButton { font-size: 26px; font-weight: 700; min-height: 82px; }"
+            "#executeButton { background: #a66616; font-size: 26px; font-weight: 700; min-height: 82px; }"
+            "#taskActionPanel QComboBox { font-size: 22px; font-weight: 700; min-height: 64px; }"
             "#executeButton:pressed { background: #75480d; }"
             "#exitButton { background: #9b3a3a; }"
             "#exitButton:pressed { background: #702727; }"
@@ -656,6 +672,7 @@ class RecognitionWindow(QMainWindow):
             return
         self._task_mode = mode
         is_configuration = mode == "configuration"
+        self._configuration_sidebar.setVisible(is_configuration)
         for control in self._task_controls:
             control.setVisible(not is_configuration)
         for control in self._configuration_controls:
