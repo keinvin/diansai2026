@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -71,6 +72,7 @@ from test.locate_red_a4 import locate_red_a4  # noqa: E402
 
 RED_A4_CORNERS_PATH = PROJECT_ROOT / "data" / "red_a4_corners.json"
 FINISHED_SOUND_PATH = Path(__file__).with_name("finished.wav")
+HARDWARE_POLL_INTERVAL_MS = 500
 # Keep manual calibration identical to test/locate_red_a4.py.
 SCREEN_CORNER_NAMES = ("屏幕左上", "屏幕右上（被遮挡）", "屏幕右下", "屏幕左下")
 A4_FROM_SCREEN = (1, 2, 3, 0)  # A4 TL/TR/BR/BL = screen TR/BR/BL/TL
@@ -280,6 +282,91 @@ def save_recognition_example(
     if not cv2.imwrite(str(path), frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]):
         raise RuntimeError(f"无法写入识别样例：{path}")
     return path
+
+
+class HardwareWaitDialog(QDialog):
+    """Block startup until every USB device needed by the main UI exists."""
+
+    def __init__(self, devices: list[tuple[str, str]]) -> None:
+        super().__init__()
+        self._devices = devices
+        self._device_labels: list[QLabel] = []
+        self._ready = False
+        self.setWindowTitle("设备连接检查")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.setStyleSheet(
+            "QDialog { background: #171a20; color: #eef2f7; }"
+            "#hardwareTitle { font-size: 30px; font-weight: 700; color: #ffffff; }"
+            "#hardwareSummary { font-size: 20px; color: #c7d0dc; }"
+            "#hardwareDeviceState { background: #242933; border: 1px solid #394150;"
+            " font-size: 20px; padding: 14px; }"
+            "QPushButton { background: #9b3a3a; color: white; border: 0;"
+            " font-size: 20px; padding: 12px 20px; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 28, 28, 24)
+        layout.setSpacing(14)
+        title = QLabel("正在检查 USB 设备")
+        title.setObjectName("hardwareTitle")
+        layout.addWidget(title)
+        self._summary = QLabel()
+        self._summary.setObjectName("hardwareSummary")
+        self._summary.setWordWrap(True)
+        layout.addWidget(self._summary)
+        for _label, _path in self._devices:
+            state = QLabel()
+            state.setObjectName("hardwareDeviceState")
+            state.setWordWrap(True)
+            self._device_labels.append(state)
+            layout.addWidget(state)
+        layout.addStretch(1)
+        exit_button = QPushButton("退出程序")
+        exit_button.clicked.connect(self.reject)
+        layout.addWidget(exit_button, 0, Qt.AlignRight)
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(HARDWARE_POLL_INTERVAL_MS)
+        self._poll_timer.timeout.connect(self._refresh)
+        self._refresh()
+        self._poll_timer.start()
+
+    def _refresh(self) -> None:
+        missing: list[str] = []
+        for (label, path), state in zip(self._devices, self._device_labels):
+            connected = Path(path).exists()
+            state.setText(
+                f"{'已连接' if connected else '未检测到'}  {label}\n{path}"
+            )
+            state.setStyleSheet(
+                "color: #51d59b;" if connected else "color: #ff8c8c;"
+            )
+            if not connected:
+                missing.append(label)
+        if missing:
+            self._summary.setText("正在等待：" + "、".join(missing))
+            return
+        self._summary.setText("设备已就绪，正在进入主界面…")
+        if not self._ready:
+            self._ready = True
+            self._poll_timer.stop()
+            QTimer.singleShot(250, self.accept)
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        self._poll_timer.stop()
+        super().done(result)
+
+
+def wait_for_required_hardware(camera_device: str) -> bool:
+    """Show a live device monitor before opening the camera or main window."""
+
+    hardware = load_config().get("hardware", {})
+    devices = [
+        ("摄像头", camera_device),
+        ("GRBL 控制器", str(hardware.get("grbl_port", "/dev/diansai-grbl"))),
+        ("舵机总线", str(hardware.get("servo_port", "/dev/diansai-servo"))),
+    ]
+    return HardwareWaitDialog(devices).exec() == QDialog.DialogCode.Accepted
 
 
 class CameraView(QWidget):
@@ -1302,6 +1389,8 @@ def main() -> int:
     args = parser.parse_args()
 
     application = QApplication(sys.argv)
+    if not wait_for_required_hardware(args.device):
+        return 0
     window = RecognitionWindow(args.device, args.fullscreen)
     if not args.fullscreen:
         window.resize(1440, 850)
