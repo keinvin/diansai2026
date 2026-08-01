@@ -73,6 +73,59 @@ class SolverTest(unittest.TestCase):
         self.assertTrue(all(np.linalg.norm(offset) <= 8.0 + 1e-9 for offset in offsets))
         self.assertEqual(len(placed), 2)
 
+    def test_adjacency_offsets_propagate_gap_across_parallel_strips(self):
+        polygons = [
+            np.asarray(
+                [[start, 0.0], [start + 20.0, 0.0], [start + 20.0, 30.0], [start, 30.0]],
+                dtype=float,
+            )
+            for start in (0.0, 20.0, 40.0, 60.0)
+        ]
+        config = SolverConfig(
+            placement_gap_mm=1.5,
+            max_placement_gap_mm=8.0,
+            final_overlap_tolerance_mm2=0.25,
+        )
+
+        placed, offsets, _, _, overlap, achieved, satisfied = (
+            _apply_safe_placement_gap(
+                polygons, ["a", "b", "c", "d"], 80.0, 30.0, config
+            )
+        )
+
+        self.assertTrue(satisfied)
+        self.assertGreaterEqual(achieved, 1.5 - 1e-6)
+        self.assertLessEqual(overlap, 0.25)
+        offset_x = [float(offset[0]) for offset in offsets]
+        self.assertTrue(
+            all(second - first >= 1.5 - 1e-4 for first, second in zip(offset_x, offset_x[1:]))
+        )
+        self.assertEqual(len(placed), 4)
+
+    def test_best_non_overlapping_gap_is_returned_as_fallback(self):
+        polygons = [
+            np.asarray([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=float),
+            np.asarray([[10.3, 0], [20.3, 0], [20.3, 10], [10.3, 10]], dtype=float),
+        ]
+        config = SolverConfig(
+            placement_gap_mm=1.5,
+            max_placement_gap_mm=2.0,
+            final_overlap_tolerance_mm2=0.25,
+        )
+        zero_offsets = [np.zeros(2), np.zeros(2)]
+
+        with patch(
+            "puzzle_solver.solver._placement_offsets",
+            return_value=zero_offsets,
+        ):
+            _, _, _, _, overlap, achieved, satisfied = _apply_safe_placement_gap(
+                polygons, ["a", "b"], 20.3, 10.0, config
+            )
+
+        self.assertFalse(satisfied)
+        self.assertLessEqual(overlap, 0.25)
+        self.assertAlmostEqual(achieved, 0.3, places=5)
+
     def test_fixed_four_piece_example(self):
         result = solve_puzzle(
             PIECES,
@@ -90,7 +143,8 @@ class SolverTest(unittest.TestCase):
             result["metrics"]["final_overlap_area_mm2"],
             result["config"]["final_overlap_tolerance_mm2"],
         )
-        self.assertGreaterEqual(result["metrics"]["applied_placement_gap_mm"], 1.5)
+        self.assertTrue(result["metrics"]["placement_gap_satisfied"])
+        self.assertGreaterEqual(result["metrics"]["achieved_placement_gap_mm"], 1.5)
         self.assertLessEqual(result["metrics"]["max_adjacent_vertex_distance_mm"], 20.0)
         self.assertGreaterEqual(len(result["adjacencies"]), 3)
         for adjacency in result["adjacencies"]:

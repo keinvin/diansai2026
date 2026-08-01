@@ -1173,10 +1173,18 @@ class RecognitionWindow(QMainWindow):
                 pattern_line = "花纹：画面纹理不足，未作为有效判据"
             detail_lines.append(
                 "拼接误差：孔洞 {:.2%}，搜索重叠 {:.2%}\n"
-                "安全间隙 {:.1f} mm，最终重叠 {:.2f} mm2，邻边顶点最大距离 {:.1f} mm\n{}".format(
+                "实际/目标间隙 {:.1f}/{:.1f} mm{}，最终重叠 {:.2f} mm2，邻边顶点最大距离 {:.1f} mm\n{}".format(
                     solution["metrics"]["hole_ratio"],
                     solution["metrics"]["overlap_ratio"],
-                    solution["metrics"]["applied_placement_gap_mm"],
+                    solution["metrics"].get(
+                        "achieved_placement_gap_mm",
+                        solution["metrics"]["applied_placement_gap_mm"],
+                    ),
+                    solution["metrics"].get(
+                        "requested_placement_gap_mm",
+                        solution["metrics"]["applied_placement_gap_mm"],
+                    ),
+                    "" if solution["metrics"].get("placement_gap_satisfied", True) else "（使用最大可用间隙）",
                     solution["metrics"]["final_overlap_area_mm2"],
                     solution["metrics"]["max_adjacent_vertex_distance_mm"],
                     pattern_line,

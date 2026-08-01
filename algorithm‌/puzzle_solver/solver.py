@@ -623,10 +623,80 @@ def _detect_edge_adjacencies(
 
 
 def _placement_offsets(
-    polygons: Sequence[np.ndarray], width: float, height: float, gap_mm: float
+    polygons: Sequence[np.ndarray],
+    width: float,
+    height: float,
+    gap_mm: float,
+    adjacencies: Sequence[dict] | None = None,
+    maximum_offset_mm: float = math.inf,
 ) -> list[np.ndarray]:
     if len(polygons) <= 1 or gap_mm <= 0.0:
         return [np.zeros(2, dtype=float) for _ in polygons]
+
+    if adjacencies:
+        offsets = [np.zeros(2, dtype=float) for _ in polygons]
+        centres = [polygon.mean(axis=0) for polygon in polygons]
+        constraints: list[tuple[int, int, np.ndarray, float]] = []
+        for adjacency in adjacencies:
+            piece_a = int(adjacency["piece_a"])
+            piece_b = int(adjacency["piece_b"])
+            polygon_a = polygons[piece_a]
+            polygon_b = polygons[piece_b]
+            edge_a = int(adjacency["edge_a"])
+            edge_b = int(adjacency["edge_b"])
+            a0 = polygon_a[edge_a]
+            a1 = polygon_a[(edge_a + 1) % len(polygon_a)]
+            b0 = polygon_b[edge_b]
+            b1 = polygon_b[(edge_b + 1) % len(polygon_b)]
+            interval_a = adjacency.get("edge_a_interval", [0.0, 1.0])
+            interval_b = adjacency.get(
+                "edge_b_interval",
+                [1.0, 0.0] if adjacency["edge_b_reversed"] else [0.0, 1.0],
+            )
+            midpoint_a = (
+                a0 + (a1 - a0) * float(sum(interval_a)) * 0.5
+            )
+            midpoint_b = (
+                b0 + (b1 - b0) * float(sum(interval_b)) * 0.5
+            )
+            edge_direction = a1 - a0
+            edge_length = float(np.linalg.norm(edge_direction))
+            if edge_length <= 1e-9:
+                continue
+            normal = np.asarray(
+                [-edge_direction[1], edge_direction[0]], dtype=float
+            ) / edge_length
+            if float(np.dot(normal, centres[piece_b] - centres[piece_a])) < 0.0:
+                normal *= -1.0
+            base_separation = float(np.dot(midpoint_b - midpoint_a, normal))
+            constraints.append((piece_a, piece_b, normal, base_separation))
+
+        # Project pair constraints repeatedly. Shared pieces propagate the gap
+        # through chains, producing cumulative offsets for strip-like layouts.
+        for _ in range(64):
+            largest_deficit = 0.0
+            for piece_a, piece_b, normal, base_separation in constraints:
+                separation = base_separation + float(
+                    np.dot(offsets[piece_b] - offsets[piece_a], normal)
+                )
+                deficit = gap_mm - separation
+                if deficit <= 1e-6:
+                    continue
+                largest_deficit = max(largest_deficit, deficit)
+                adjustment = normal * (deficit * 0.5)
+                offsets[piece_a] -= adjustment
+                offsets[piece_b] += adjustment
+
+            mean_offset = np.mean(offsets, axis=0)
+            for index in range(len(offsets)):
+                offsets[index] -= mean_offset
+                norm = float(np.linalg.norm(offsets[index]))
+                if norm > maximum_offset_mm > 0.0:
+                    offsets[index] *= maximum_offset_mm / norm
+            if largest_deficit <= 1e-4:
+                break
+        if constraints:
+            return offsets
 
     rectangle_centre = np.array([width * 0.5, height * 0.5], dtype=float)
     offsets: list[np.ndarray] = []
@@ -1107,7 +1177,7 @@ def _apply_safe_placement_gap(
     width: float,
     height: float,
     config: SolverConfig,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[dict], float, float]:
+) -> tuple[list[np.ndarray], list[np.ndarray], list[dict], float, float, float, bool]:
     adjacencies = _detect_edge_adjacencies(polygons, piece_ids, config)
     requested_gap = max(0.0, config.placement_gap_mm)
     maximum_gap = max(requested_gap, config.max_placement_gap_mm)
@@ -1115,8 +1185,17 @@ def _apply_safe_placement_gap(
     if len(gaps) == 0:
         gaps = np.array([0.0])
 
+    best_result = None
+    best_quality = None
     for gap in gaps:
-        offsets = _placement_offsets(polygons, width, height, float(gap))
+        offsets = _placement_offsets(
+            polygons,
+            width,
+            height,
+            float(gap),
+            adjacencies,
+            maximum_gap,
+        )
         placed, offsets, overlap_area = _resolve_placement_overlaps(
             polygons,
             offsets,
@@ -1133,8 +1212,29 @@ def _apply_safe_placement_gap(
         )
         if not vertices_valid:
             continue
-        if _minimum_piece_clearance(placed) + 1e-6 >= requested_gap:
-            return placed, offsets, checked_adjacencies, float(gap), overlap_area
+        achieved_gap = _minimum_piece_clearance(placed)
+        quality = (
+            achieved_gap,
+            -overlap_area,
+            -sum(float(np.linalg.norm(offset)) for offset in offsets),
+        )
+        candidate = (
+            placed,
+            offsets,
+            checked_adjacencies,
+            float(gap),
+            overlap_area,
+            achieved_gap,
+            achieved_gap + 1e-6 >= requested_gap,
+        )
+        if best_quality is None or quality > best_quality:
+            best_quality = quality
+            best_result = candidate
+        if candidate[-1]:
+            return candidate
+
+    if best_result is not None:
+        return best_result
 
     raise RuntimeError(
         "A geometric assembly was found, but no safe placement satisfied the "
@@ -1317,6 +1417,8 @@ def solve_puzzle(
                 adjacencies,
                 applied_gap_mm,
                 final_overlap_area_mm2,
+                achieved_gap_mm,
+                gap_satisfied,
             ) = _apply_safe_placement_gap(
                 assembled_polygons,
                 ids,
@@ -1351,6 +1453,8 @@ def solve_puzzle(
             continue
         ranked_score = (
             score
+            + max(0.0, config.placement_gap_mm - achieved_gap_mm)
+            / max(config.placement_gap_mm, 1e-6)
             + config.pattern_score_weight * pattern_mismatch * pattern_evidence
             + config.rounded_corner_score_weight
             * rounded_corner_mismatch
@@ -1375,6 +1479,8 @@ def solve_puzzle(
                 adjacencies,
                 applied_gap_mm,
                 final_overlap_area_mm2,
+                achieved_gap_mm,
+                gap_satisfied,
                 connected,
                 pattern_mismatch,
                 pattern_evidence,
@@ -1407,6 +1513,8 @@ def solve_puzzle(
         adjacencies,
         applied_gap_mm,
         final_overlap_area_mm2,
+        achieved_gap_mm,
+        gap_satisfied,
         connected,
         pattern_mismatch,
         pattern_evidence,
@@ -1451,6 +1559,9 @@ def solve_puzzle(
             **metrics,
             "total_search_nodes": total_nodes,
             "applied_placement_gap_mm": applied_gap_mm,
+            "requested_placement_gap_mm": config.placement_gap_mm,
+            "achieved_placement_gap_mm": achieved_gap_mm,
+            "placement_gap_satisfied": gap_satisfied,
             "final_overlap_area_mm2": final_overlap_area_mm2,
             "max_adjacent_vertex_distance_mm": max(
                 (

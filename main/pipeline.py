@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import itertools
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Callable, Sequence
 
 import numpy as np
@@ -233,6 +233,9 @@ def build_transport_solution(
             "hole_ratio": 0.0,
             "overlap_ratio": 0.0,
             "applied_placement_gap_mm": applied_gap_mm,
+            "requested_placement_gap_mm": applied_gap_mm,
+            "achieved_placement_gap_mm": applied_gap_mm,
+            "placement_gap_satisfied": True,
             "final_overlap_area_mm2": 0.0,
             "max_adjacent_vertex_distance_mm": 0.0,
         },
@@ -321,7 +324,13 @@ class MainPipeline:
         elif enabled:
             with timings.measure("solve"):
                 try:
-                    edge_profiles = extract_edge_profiles(corrected_frame, result.pieces)
+                    # White pieces are geometry-only. Passing empty-looking edge
+                    # profiles enables the much broader appearance search path.
+                    edge_profiles = (
+                        extract_edge_profiles(corrected_frame, result.pieces)
+                        if use_piece_features
+                        else None
+                    )
                     piece_features = (
                         extract_piece_features(
                             corrected_frame, result.pieces, calibration
@@ -329,11 +338,16 @@ class MainPipeline:
                         if use_piece_features
                         else None
                     )
+                    solver_config = (
+                        self.solver_config
+                        if use_piece_features
+                        else replace(self.solver_config, relaxed_search_first=False)
+                    )
                     solution = solve_puzzle(
                         [piece.polygon_mm for piece in result.pieces],
                         [piece.id for piece in result.pieces],
                         target_origin_mm=(0.0, 0.0),
-                        config=self.solver_config,
+                        config=solver_config,
                         edge_profiles=edge_profiles,
                         piece_features=piece_features,
                     )
